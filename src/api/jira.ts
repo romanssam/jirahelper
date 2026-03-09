@@ -1,4 +1,12 @@
-import type { DashboardData, MetricPoint, MonthlyPoint, QualityStats, SnapshotPoint } from '../types';
+import type {
+  CompetencyStats,
+  DashboardData,
+  MetricPoint,
+  MonthlyPoint,
+  PersonalStats,
+  QualityStats,
+  SnapshotPoint
+} from '../types';
 
 const baseUrl = import.meta.env.DEV ? '/jira' : import.meta.env.VITE_JIRA_BASE_URL;
 const email = import.meta.env.VITE_JIRA_USER_EMAIL;
@@ -12,6 +20,58 @@ const reopenedStatuses = (import.meta.env.VITE_JIRA_REOPENED_STATUSES ?? 'Reopen
 const WIP_SNAPSHOT_KEY = 'jira_dashboard_wip_snapshots';
 const MAX_CONCURRENCY = 4;
 const inFlightByPeriod = new Map<number, Promise<DashboardData>>();
+const competencyModel: Array<{ key: string; label: string; keywords: string[] }> = [
+  {
+    key: 'frontend_architecture',
+    label: 'Frontend архитектура',
+    keywords: ['architecture', 'архитектур', 'refactor', 'рефактор', 'component', 'компонент', 'ui kit', 'design system']
+  },
+  {
+    key: 'testing_quality',
+    label: 'Тестирование и качество',
+    keywords: ['test', 'тест', 'qa', 'e2e', 'cypress', 'playwright', 'jest', 'vitest', 'regression', 'регресс']
+  },
+  {
+    key: 'performance',
+    label: 'Производительность',
+    keywords: ['performance', 'оптимиз', 'lcp', 'cls', 'tbt', 'bundle', 'cache', 'кэш', 'latency']
+  },
+  {
+    key: 'accessibility',
+    label: 'Доступность',
+    keywords: ['accessibility', 'a11y', 'доступност', 'wcag', 'aria', 'screen reader']
+  },
+  {
+    key: 'product_analytics',
+    label: 'Продуктовая аналитика',
+    keywords: ['analytics', 'аналитик', 'metric', 'метрик', 'ab test', 'experiment', 'amplitude', 'segment']
+  },
+  {
+    key: 'backend_integration',
+    label: 'Интеграция с backend',
+    keywords: ['api', 'graphql', 'rest', 'backend', 'бэкенд', 'integration', 'интеграц', 'contract']
+  },
+  {
+    key: 'devops_observability',
+    label: 'DevOps и наблюдаемость',
+    keywords: ['ci', 'cd', 'pipeline', 'docker', 'kubernetes', 'sentry', 'grafana', 'monitoring', 'логирован']
+  },
+  {
+    key: 'security_privacy',
+    label: 'Безопасность',
+    keywords: ['security', 'безопасност', 'auth', 'oauth', 'jwt', 'xss', 'csrf', 'permission', 'rbac']
+  },
+  {
+    key: 'incident_support',
+    label: 'Инциденты и поддержка',
+    keywords: ['hotfix', 'prod', 'incident', 'oncall', 'дежур', 'авар', 'rollback', 'support']
+  },
+  {
+    key: 'leadership_delivery',
+    label: 'Лидерство и delivery',
+    keywords: ['epic', 'initiative', 'roadmap', 'planning', 'планирован', 'coordination', 'координац', 'mentoring', 'ментор']
+  }
+];
 
 function getAuthHeader() {
   if (!token) return undefined;
@@ -203,6 +263,156 @@ function saveWipSnapshot(todayIso: string, wip: number): SnapshotPoint[] {
 
   localStorage.setItem(WIP_SNAPSHOT_KEY, JSON.stringify(next));
   return next;
+}
+
+function flattenText(input: unknown): string {
+  if (typeof input === 'string') return input;
+  if (!input || typeof input !== 'object') return '';
+
+  const node = input as {
+    text?: unknown;
+    content?: unknown;
+    attrs?: Record<string, unknown>;
+  };
+  const chunks: string[] = [];
+
+  if (typeof node.text === 'string') chunks.push(node.text);
+  if (node.attrs) {
+    Object.values(node.attrs).forEach((value) => {
+      if (typeof value === 'string') chunks.push(value);
+    });
+  }
+  if (Array.isArray(node.content)) {
+    node.content.forEach((child) => {
+      const nested = flattenText(child);
+      if (nested) chunks.push(nested);
+    });
+  }
+
+  return chunks.join(' ');
+}
+
+function getCompetencyLevel(score: number): 'начальный' | 'рабочий' | 'сильный' | 'эксперт' {
+  if (score >= 45) return 'эксперт';
+  if (score >= 25) return 'сильный';
+  if (score >= 10) return 'рабочий';
+  return 'начальный';
+}
+
+async function fetchCompetencyStatsYear(): Promise<CompetencyStats> {
+  try {
+    const pageSize = 50;
+    const maxPages = 12;
+    const jql = buildJql([assigneeWasClause(), 'resolved >= -365d', 'resolved IS NOT EMPTY']);
+    let startAt = 0;
+    let page = 0;
+    let total = 0;
+    const nowMs = Date.now();
+    const ninetyDaysMs = 90 * 24 * 60 * 60 * 1000;
+    const issues: Array<{ key: string; summary: string; corpus: string; isRecent: boolean }> = [];
+
+    while (page < maxPages) {
+      const payload = await fetchSearch<{
+        total?: number;
+        issues?: Array<{
+          key?: string;
+          fields?: {
+            summary?: string;
+            description?: unknown;
+            labels?: string[];
+            components?: Array<{ name?: string }>;
+            issuetype?: { name?: string };
+            priority?: { name?: string };
+            resolved?: string;
+          };
+        }>;
+      }>(jql, {
+        startAt: String(startAt),
+        maxResults: String(pageSize),
+        fields: 'summary,description,labels,components,issuetype,priority,resolved'
+      });
+
+      const pageIssues = payload.issues ?? [];
+      if (page === 0) total = payload.total ?? 0;
+      if (!pageIssues.length) break;
+
+      pageIssues.forEach((issue) => {
+        const fields = issue.fields ?? {};
+        const summary = fields.summary ?? '';
+        const description = flattenText(fields.description);
+        const labels = (fields.labels ?? []).join(' ');
+        const components = (fields.components ?? []).map((component) => component.name ?? '').join(' ');
+        const issueType = fields.issuetype?.name ?? '';
+        const priority = fields.priority?.name ?? '';
+        const resolved = fields.resolved ?? '';
+        const resolvedMs = Date.parse(resolved);
+        const isRecent = Number.isFinite(resolvedMs) ? nowMs - resolvedMs <= ninetyDaysMs : false;
+        issues.push({
+          key: issue.key ?? '',
+          summary,
+          corpus: `${summary} ${description} ${labels} ${components} ${issueType} ${priority}`.toLowerCase(),
+          isRecent
+        });
+      });
+
+      startAt += pageSize;
+      page += 1;
+      if (issues.length >= total) break;
+    }
+
+    const matrix = competencyModel
+      .map((model) => {
+        let issueCountYear = 0;
+        let issueCount90 = 0;
+        const sampleIssues: string[] = [];
+
+        issues.forEach((issue) => {
+          const matched = model.keywords.some((keyword) => issue.corpus.includes(keyword));
+          if (!matched) return;
+          issueCountYear += 1;
+          if (issue.isRecent) issueCount90 += 1;
+          if (sampleIssues.length < 3 && issue.key) sampleIssues.push(`${issue.key}: ${issue.summary}`);
+        });
+
+        const score = round2(issueCountYear * 1 + issueCount90 * 1.5);
+        return {
+          key: model.key,
+          label: model.label,
+          score,
+          level: getCompetencyLevel(score),
+          issueCountYear,
+          issueCount90,
+          sampleIssues
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const breadth = matrix.filter((item) => item.issueCountYear > 0).length;
+    const coveragePercent = competencyModel.length > 0 ? round2((breadth / competencyModel.length) * 100) : 0;
+
+    return {
+      analyzedIssuesYear: issues.length,
+      breadth,
+      coveragePercent,
+      matrix
+    };
+  } catch (error) {
+    console.warn('Competency matrix fallback:', error);
+    return {
+      analyzedIssuesYear: 0,
+      breadth: 0,
+      coveragePercent: 0,
+      matrix: competencyModel.map((item) => ({
+        key: item.key,
+        label: item.label,
+        score: 0,
+        level: 'начальный',
+        issueCountYear: 0,
+        issueCount90: 0,
+        sampleIssues: []
+      }))
+    };
+  }
 }
 
 async function fetchIssueQualityStats90(): Promise<QualityStats> {
@@ -418,6 +628,11 @@ async function buildDashboardData(periodMonths: number): Promise<DashboardData> 
       jql: buildJql([assigneeWasClause(), 'resolved >= -180d', 'timeoriginalestimate IS NOT EMPTY'])
     },
     {
+      key: 'withEstimate90',
+      label: 'Resolved с оценкой за 90д',
+      jql: buildJql([assigneeWasClause(), 'resolved >= -90d', 'timeoriginalestimate IS NOT EMPTY'])
+    },
+    {
       key: 'withEstimate365',
       label: 'Resolved с оценкой за 365д',
       jql: buildJql([assigneeWasClause(), 'resolved >= -365d', 'timeoriginalestimate IS NOT EMPTY'])
@@ -503,17 +718,33 @@ async function buildDashboardData(periodMonths: number): Promise<DashboardData> 
         `resolved >= ${quote(bucket.start)}`,
         `resolved < ${quote(bucket.next)}`
       ]);
+      const withEstimateJql = buildJql([
+        assigneeWasClause(),
+        `resolved >= ${quote(bucket.start)}`,
+        `resolved < ${quote(bucket.next)}`,
+        'timeoriginalestimate IS NOT EMPTY'
+      ]);
+      const highPriorityJql = buildJql([
+        assigneeWasClause(),
+        `resolved >= ${quote(bucket.start)}`,
+        `resolved < ${quote(bucket.next)}`,
+        'priority IN (Highest, High)'
+      ]);
 
       const resolved = await fetchTotal(resolvedJql);
       const created = await fetchTotal(createdJql);
       const bugs = await fetchTotal(bugsJql);
+      const withEstimate = await fetchTotal(withEstimateJql);
+      const highPriorityResolved = await fetchTotal(highPriorityJql);
 
       return {
         month: bucket.start.slice(0, 7),
         monthLabel: bucket.label,
         created,
         resolved,
-        bugs
+        bugs,
+        withEstimate,
+        highPriorityResolved
       };
     });
 
@@ -523,6 +754,9 @@ async function buildDashboardData(periodMonths: number): Promise<DashboardData> 
 
   const monthly: MonthlyPoint[] = monthlyRaw.map((point, index) => ({
     ...point,
+    estimateCoveragePercent: point.resolved > 0 ? round2((point.withEstimate / point.resolved) * 100) : 0,
+    bugSharePercent: point.resolved > 0 ? round2((point.bugs / point.resolved) * 100) : 0,
+    urgentSharePercent: point.resolved > 0 ? round2((point.highPriorityResolved / point.resolved) * 100) : 0,
     ma3: ma3[index],
     ma6: ma6[index]
   }));
@@ -614,8 +848,33 @@ async function buildDashboardData(periodMonths: number): Promise<DashboardData> 
     makeVolumeAssessment('За год', metricValue('throughput365'), metricValue('withEstimate365'), 12)
   ];
   const worklog = await fetchCurrentMonthWorklogStats();
+  const competency = await fetchCompetencyStatsYear();
   const bugRate90 = throughput90 > 0 ? (metricValue('bugs90') / throughput90) * 100 : 0;
   const reopenedRate90 = throughput90 > 0 ? (metricValue('reopened90') / throughput90) * 100 : 0;
+  const throughput365 = metricValue('throughput365');
+  const backlogCurrent = metricValue('wipNow');
+  const throughputMomentum30to90Percent =
+    throughputPerWeek90 > 0 ? round2((throughputPerWeek30 / throughputPerWeek90) * 100) : 0;
+  const wipPressureWeeks = throughputPerWeek90 > 0 ? round2(backlogCurrent / throughputPerWeek90) : 0;
+  const personal: PersonalStats = {
+    estimateCoverage90Percent:
+      throughput90 > 0 ? round2((metricValue('withEstimate90') / throughput90) * 100) : 0,
+    urgentLoadShare90Percent: throughput90 > 0 ? round2((metricValue('fires90') / throughput90) * 100) : 0,
+    bugShare90Percent: throughput90 > 0 ? round2((metricValue('bugs90') / throughput90) * 100) : 0,
+    reopenRate90Percent: throughput90 > 0 ? round2((metricValue('reopened90') / throughput90) * 100) : 0,
+    staleShareCurrentPercent: backlogCurrent > 0 ? round2((metricValue('stale14') / backlogCurrent) * 100) : 0,
+    executionFocusPercent: backlogCurrent > 0 ? round2((metricValue('wipInProgress') / backlogCurrent) * 100) : 0,
+    complexityShareYearPercent: throughput365 > 0 ? round2((metricValue('substantialYear') / throughput365) * 100) : 0,
+    initiativeShareYearPercent: throughput365 > 0 ? round2((metricValue('closedEpicsYear') / throughput365) * 100) : 0,
+    deliveryStabilityIndex:
+      throughputPerWeek90 > 0
+        ? round2(clamp(100 - Math.abs((throughputPerWeek30 / throughputPerWeek90) * 100 - 100), 0, 100))
+        : 0,
+    throughputMomentum30to90Percent,
+    wipPressureWeeks,
+    competencyBreadth: competency.breadth,
+    competencyCoveragePercent: competency.coveragePercent
+  };
   const predictabilityScore = round2(
     (clamp(100 - quality.noEstimateShare * 2, 0, 100) +
       clamp(100 - quality.overrunShare * 2, 0, 100) +
@@ -672,7 +931,9 @@ async function buildDashboardData(periodMonths: number): Promise<DashboardData> 
       flowScore,
       deliveryScore,
       overallCoreScore
-    }
+    },
+    personal,
+    competency
   };
 }
 

@@ -18,6 +18,11 @@ export type MonthlyPoint = {
   created: number;
   resolved: number;
   bugs: number;
+  withEstimate: number;
+  highPriorityResolved: number;
+  estimateCoveragePercent: number;
+  bugSharePercent: number;
+  urgentSharePercent: number;
   ma3: number | null;
   ma6: number | null;
 };
@@ -78,6 +83,39 @@ export type CharacteristicsStats = {
   overallCoreScore: number;
 };
 
+export type PersonalStats = {
+  estimateCoverage90Percent: number;
+  urgentLoadShare90Percent: number;
+  bugShare90Percent: number;
+  reopenRate90Percent: number;
+  staleShareCurrentPercent: number;
+  executionFocusPercent: number;
+  complexityShareYearPercent: number;
+  initiativeShareYearPercent: number;
+  deliveryStabilityIndex: number;
+  throughputMomentum30to90Percent: number;
+  wipPressureWeeks: number;
+  competencyBreadth: number;
+  competencyCoveragePercent: number;
+};
+
+export type CompetencyItem = {
+  key: string;
+  label: string;
+  score: number;
+  level: 'начальный' | 'рабочий' | 'сильный' | 'эксперт';
+  issueCountYear: number;
+  issueCount90: number;
+  sampleIssues: string[];
+};
+
+export type CompetencyStats = {
+  analyzedIssuesYear: number;
+  coveragePercent: number;
+  breadth: number;
+  matrix: CompetencyItem[];
+};
+
 export type DashboardData = {
   fetchedAt: string;
   periodMonths: number;
@@ -88,6 +126,8 @@ export type DashboardData = {
   wipTrend: SnapshotPoint[];
   worklog: WorklogStats;
   characteristics: CharacteristicsStats;
+  personal: PersonalStats;
+  competency: CompetencyStats;
 };
 
 export type AiAssessment = {

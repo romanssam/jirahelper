@@ -1,10 +1,17 @@
-import { useEffect, useMemo, useState } from 'react';
+import html2canvas from 'html2canvas';
+import { jsPDF } from 'jspdf';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bar,
   BarChart,
   CartesianGrid,
   ComposedChart,
   Legend,
+  PolarAngleAxis,
+  PolarGrid,
+  PolarRadiusAxis,
+  Radar,
+  RadarChart,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -32,6 +39,15 @@ function formatNumber(value: number): string {
 function formatDecimal(value: number | null): string {
   if (value == null) return 'нет данных';
   return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(value);
+}
+
+function formatMoney(value: number | null): string {
+  if (value == null) return 'нет данных';
+  return new Intl.NumberFormat('ru-RU', {
+    style: 'currency',
+    currency: 'RUB',
+    maximumFractionDigits: 0
+  }).format(value);
 }
 
 function formatDateTime(iso: string): string {
@@ -66,14 +82,61 @@ function getEstimateToFactSpeedAssessment(value: number): string {
   return 'выше нормы: оценки с запасом или задачи закрываются быстрее ожиданий';
 }
 
+function getHigherIsBetterAssessment(value: number, goodThreshold: number, warnThreshold: number): string {
+  if (!Number.isFinite(value) || value <= 0) return 'нет данных';
+  if (value >= goodThreshold) return 'хорошо';
+  if (value >= warnThreshold) return 'нормально';
+  return 'риск';
+}
+
+function getLowerIsBetterAssessment(value: number, goodThreshold: number, warnThreshold: number): string {
+  if (!Number.isFinite(value)) return 'нет данных';
+  if (value <= goodThreshold) return 'хорошо';
+  if (value <= warnThreshold) return 'нормально';
+  return 'риск';
+}
+
+function getWipPressureAssessment(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return 'нет данных';
+  if (value <= 2) return 'хорошо';
+  if (value <= 4) return 'нормально';
+  return 'риск';
+}
+
 function metricByKey(metrics: MetricPoint[], key: string): number {
   return metrics.find((metric) => metric.key === key)?.total ?? 0;
 }
 
 function toCsv(data: DashboardData): string {
-  const header = ['month', 'monthLabel', 'created', 'resolved', 'bugs', 'ma3', 'ma6'];
+  const header = [
+    'month',
+    'monthLabel',
+    'created',
+    'resolved',
+    'bugs',
+    'withEstimate',
+    'highPriorityResolved',
+    'estimateCoveragePercent',
+    'bugSharePercent',
+    'urgentSharePercent',
+    'ma3',
+    'ma6'
+  ];
   const rows = data.monthly.map((row) =>
-    [row.month, row.monthLabel, row.created, row.resolved, row.bugs, row.ma3 ?? '', row.ma6 ?? ''].join(',')
+    [
+      row.month,
+      row.monthLabel,
+      row.created,
+      row.resolved,
+      row.bugs,
+      row.withEstimate,
+      row.highPriorityResolved,
+      row.estimateCoveragePercent,
+      row.bugSharePercent,
+      row.urgentSharePercent,
+      row.ma3 ?? '',
+      row.ma6 ?? ''
+    ].join(',')
   );
   return [header.join(','), ...rows].join('\n');
 }
@@ -86,6 +149,67 @@ function triggerDownload(filename: string, content: string, mimeType: string) {
   anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+async function exportElementToPdf(params: {
+  element: HTMLElement;
+  filename: string;
+  title: string;
+  generatedAt: string;
+}) {
+  const canvas = await html2canvas(params.element, {
+    backgroundColor: '#ffffff',
+    scale: 2,
+    useCORS: true,
+    logging: false
+  });
+
+  const imageData = canvas.toDataURL('image/png', 1);
+  const pdf = new jsPDF('p', 'mm', 'a4');
+  const pageWidth = pdf.internal.pageSize.getWidth();
+  const pageHeight = pdf.internal.pageSize.getHeight();
+  const margin = 10;
+  const headerHeight = 15;
+  const contentWidth = pageWidth - margin * 2;
+  const imageHeight = (canvas.height * contentWidth) / canvas.width;
+  const contentStartY = margin + headerHeight;
+  const contentHeight = pageHeight - contentStartY - margin;
+
+  let renderedHeight = 0;
+  let pageIndex = 0;
+  while (renderedHeight < imageHeight) {
+    if (pageIndex > 0) pdf.addPage();
+    pdf.setFont('helvetica', 'bold');
+    pdf.setFontSize(13);
+    pdf.text(params.title, margin, margin + 6);
+    pdf.setFont('helvetica', 'normal');
+    pdf.setFontSize(9);
+    pdf.setTextColor(90, 90, 90);
+    pdf.text(`Сформировано: ${params.generatedAt}`, margin, margin + 11);
+    pdf.setTextColor(0, 0, 0);
+
+    pdf.addImage(
+      imageData,
+      'PNG',
+      margin,
+      contentStartY - renderedHeight,
+      contentWidth,
+      imageHeight,
+      undefined,
+      'FAST'
+    );
+
+    renderedHeight += contentHeight;
+    pageIndex += 1;
+  }
+
+  pdf.save(params.filename);
 }
 
 function Hint({ text }: { text: string }) {
@@ -118,6 +242,9 @@ export default function App() {
   const [aiError, setAiError] = useState<string | null>(null);
   const [salaryInput, setSalaryInput] = useState('');
   const [overtimeMultiplier, setOvertimeMultiplier] = useState(1);
+  const [pdfExporting, setPdfExporting] = useState<View | null>(null);
+  const overviewSectionRef = useRef<HTMLElement | null>(null);
+  const analyticsSectionRef = useRef<HTMLElement | null>(null);
 
   const hours = useMemo(() => calculateWorkHours(new Date()), []);
 
@@ -176,7 +303,40 @@ export default function App() {
     hasSalary && data && (data.forecast.forecastCompletedNextMonth ?? 0) > 0
       ? salary / (data.forecast.forecastCompletedNextMonth as number)
       : null;
+  const throughput30 = data ? metricByKey(data.metrics, 'throughput30') : 0;
+  const throughput90 = data ? metricByKey(data.metrics, 'throughput90') : 0;
+  const bugs90 = data ? metricByKey(data.metrics, 'bugs90') : 0;
+  const fires90 = data ? metricByKey(data.metrics, 'fires90') : 0;
+  const costPerTask30 = hasSalary && throughput30 > 0 ? salary / throughput30 : null;
+  const costPerTask90 = hasSalary && throughput90 > 0 ? (salary * 3) / throughput90 : null;
+  const bugCost90 = costPerTask90 != null ? costPerTask90 * bugs90 : null;
+  const urgentCost90 = costPerTask90 != null ? costPerTask90 * fires90 : null;
+  const backlogCostExposure =
+    taskCostByForecast != null && data ? taskCostByForecast * data.forecast.backlog : null;
+  const moneyGapVsSchedule =
+    earnedByWorklog != null && earnedBySchedule != null ? earnedByWorklog - earnedBySchedule : null;
+  const overtimeHoursCurrentMonth = Math.max(loggedHoursCurrentMonth - hours.elapsedHours, 0);
+  const overtimePremiumCost =
+    planHourlyRate != null ? overtimeHoursCurrentMonth * planHourlyRate * Math.max(overtimeMultiplier - 1, 0) : null;
   const finalRating = data?.characteristics.overallCoreScore ?? null;
+  const monthlyMoneyTrend = useMemo(
+    () =>
+      data?.monthly.map((row) => ({
+        monthLabel: row.monthLabel,
+        costPerTask: hasSalary && row.resolved > 0 ? salary / row.resolved : null,
+        bugCost: hasSalary && row.resolved > 0 ? (salary / row.resolved) * row.bugs : null
+      })) ?? [],
+    [data, hasSalary, salary]
+  );
+  const competencyRadarData = useMemo(
+    () =>
+      data?.competency.matrix.slice(0, 6).map((item) => ({
+        skill: item.label.length > 20 ? `${item.label.slice(0, 20)}...` : item.label,
+        fullLabel: item.label,
+        score: item.score
+      })) ?? [],
+    [data]
+  );
 
   async function handleAiAssessment() {
     if (!data) return;
@@ -198,6 +358,38 @@ export default function App() {
       setAiError(err instanceof Error ? err.message : 'Не удалось получить AI-разбор.');
     } finally {
       setAiLoading(false);
+    }
+  }
+
+  async function handleExportPdf(targetView: View) {
+    if (!data || loading) return;
+    const previousView = view;
+    setPdfExporting(targetView);
+    try {
+      if (targetView !== view) {
+        setView(targetView);
+        await sleep(450);
+      } else {
+        await sleep(250);
+      }
+
+      const element = targetView === 'overview' ? overviewSectionRef.current : analyticsSectionRef.current;
+      if (!element) throw new Error('Не удалось подготовить секцию для экспорта.');
+
+      await exportElementToPdf({
+        element,
+        filename: `jira-${targetView}-${new Date().toISOString().slice(0, 10)}.pdf`,
+        title:
+          targetView === 'overview'
+            ? 'JIRA Metrics Hub: обзор разработчика'
+            : 'JIRA Metrics Hub: аналитика и динамика',
+        generatedAt: formatDateTime(new Date().toISOString())
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось экспортировать PDF.');
+    } finally {
+      if (previousView !== targetView) setView(previousView);
+      setPdfExporting(null);
     }
   }
 
@@ -251,6 +443,22 @@ export default function App() {
           >
             Экспорт CSV
           </button>
+          <button
+            type="button"
+            className="ghost-btn"
+            onClick={() => void handleExportPdf('overview')}
+            disabled={!data || loading || pdfExporting !== null}
+          >
+            {pdfExporting === 'overview' ? 'PDF обзора...' : 'Экспорт PDF обзора'}
+          </button>
+          <button
+            type="button"
+            className="ghost-btn"
+            onClick={() => void handleExportPdf('analytics')}
+            disabled={!data || loading || pdfExporting !== null}
+          >
+            {pdfExporting === 'analytics' ? 'PDF аналитики...' : 'Экспорт PDF аналитики'}
+          </button>
         </div>
       </section>
 
@@ -294,7 +502,7 @@ export default function App() {
           )}
 
           {view === 'overview' && (
-            <section className="grid overview-grid">
+            <section className="grid overview-grid" ref={overviewSectionRef}>
               {summaryCards.map((item) => (
                 <article key={item.label} className="card kpi-card">
                   <TitleWithHint
@@ -419,11 +627,116 @@ export default function App() {
                   Общий рейтинг: <strong>{formatDecimal(finalRating)}</strong>
                 </p>
               </article>
+
+              <article className="card large-card">
+                <TitleWithHint
+                  title="Персональные метрики (bigtech-style)"
+                  hint="Индивидуальные процессные сигналы: качество планирования, доля срочности, стабильность поставки и фокус в текущем WIP."
+                />
+                <p>
+                  Покрытие задач оценкой (90д):{' '}
+                  <strong>{formatDecimal(data.personal.estimateCoverage90Percent)}%</strong> (
+                  {getHigherIsBetterAssessment(data.personal.estimateCoverage90Percent, 75, 55)})
+                </p>
+                <p>
+                  Доля срочных задач High/Highest (90д):{' '}
+                  <strong>{formatDecimal(data.personal.urgentLoadShare90Percent)}%</strong> (
+                  {getLowerIsBetterAssessment(data.personal.urgentLoadShare90Percent, 25, 40)})
+                </p>
+                <p>
+                  Доля багов в закрытии (90д): <strong>{formatDecimal(data.personal.bugShare90Percent)}%</strong> (
+                  {getLowerIsBetterAssessment(data.personal.bugShare90Percent, 20, 35)})
+                </p>
+                <p>
+                  Rate переоткрытий (90д): <strong>{formatDecimal(data.personal.reopenRate90Percent)}%</strong> (
+                  {getLowerIsBetterAssessment(data.personal.reopenRate90Percent, 10, 20)})
+                </p>
+                <p>
+                  Доля залипших в текущем хвосте: <strong>{formatDecimal(data.personal.staleShareCurrentPercent)}%</strong> (
+                  {getLowerIsBetterAssessment(data.personal.staleShareCurrentPercent, 20, 35)})
+                </p>
+                <p>
+                  Фокус исполнения (In Progress / весь хвост):{' '}
+                  <strong>{formatDecimal(data.personal.executionFocusPercent)}%</strong> (
+                  {getHigherIsBetterAssessment(data.personal.executionFocusPercent, 55, 35)})
+                </p>
+                <p>
+                  Доля крупных задач (≥8ч) в закрытии за год:{' '}
+                  <strong>{formatDecimal(data.personal.complexityShareYearPercent)}%</strong>
+                </p>
+                <p>
+                  Доля эпиков в закрытии за год:{' '}
+                  <strong>{formatDecimal(data.personal.initiativeShareYearPercent)}%</strong>
+                </p>
+                <p>
+                  Индекс стабильности доставки (30д к 90д):{' '}
+                  <strong>{formatDecimal(data.personal.deliveryStabilityIndex)}</strong> (
+                  {getHigherIsBetterAssessment(data.personal.deliveryStabilityIndex, 85, 70)})
+                </p>
+                <p>
+                  Моментум темпа (30д к 90д):{' '}
+                  <strong>{formatDecimal(data.personal.throughputMomentum30to90Percent)}%</strong> (
+                  {getHigherIsBetterAssessment(data.personal.throughputMomentum30to90Percent, 95, 80)})
+                </p>
+                <p>
+                  Давление хвоста (недель до разгребания при темпе 90д):{' '}
+                  <strong>{formatDecimal(data.personal.wipPressureWeeks)}</strong> (
+                  {getWipPressureAssessment(data.personal.wipPressureWeeks)})
+                </p>
+                <p>
+                  Ширина компетенций: <strong>{formatNumber(data.personal.competencyBreadth)}</strong> из 10
+                </p>
+                <p>
+                  Покрытие competency-модели:{' '}
+                  <strong>{formatDecimal(data.personal.competencyCoveragePercent)}%</strong> (
+                  {getHigherIsBetterAssessment(data.personal.competencyCoveragePercent, 70, 45)})
+                </p>
+              </article>
+
+              <article className="card large-card">
+                <TitleWithHint
+                  title="Матрица компетенций по Jira-задачам"
+                  hint="Построена эвристически по текстам summary/description/labels/components задач за 365 дней."
+                />
+                <p>
+                  Проанализировано задач за год: <strong>{formatNumber(data.competency.analyzedIssuesYear)}</strong>
+                </p>
+                <div className="chart-wrap">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <RadarChart data={competencyRadarData} outerRadius="72%">
+                      <PolarGrid stroke="#d7e2ec" />
+                      <PolarAngleAxis dataKey="skill" tick={{ fontSize: 11 }} />
+                      <PolarRadiusAxis domain={[0, 60]} tick={{ fontSize: 10 }} />
+                      <Radar
+                        name="Компетенции"
+                        dataKey="score"
+                        stroke="#2563eb"
+                        fill="#2563eb"
+                        fillOpacity={0.28}
+                      />
+                      <Tooltip formatter={(value) => [formatDecimal(Number(value)), 'Score']} />
+                    </RadarChart>
+                  </ResponsiveContainer>
+                </div>
+                {data.competency.matrix.slice(0, 6).map((item) => (
+                  <div key={item.key} className="volume-row">
+                    <p>
+                      <strong>{item.label}</strong>: уровень <strong>{item.level}</strong>, score{' '}
+                      <strong>{formatDecimal(item.score)}</strong>, задач за год{' '}
+                      <strong>{formatNumber(item.issueCountYear)}</strong>, за 90 дней{' '}
+                      <strong>{formatNumber(item.issueCount90)}</strong>.
+                    </p>
+                    <p>
+                      Примеры: <strong>{item.sampleIssues.join(' | ') || 'нет данных'}</strong>
+                    </p>
+                  </div>
+                ))}
+              </article>
             </section>
           )}
 
           {view === 'analytics' && (
-            <section className="grid analytics-grid">
+            <section className="grid analytics-grid" ref={analyticsSectionRef}>
               <article className="card chart-card">
                 <p className="card-title">Созданные и выполненные задачи по месяцам</p>
                 <div className="chart-wrap">
@@ -524,6 +837,83 @@ export default function App() {
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
+              </article>
+
+              <article className="card chart-card">
+                <p className="card-title">Динамика персональных метрик по месяцам</p>
+                <div className="chart-wrap">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={data.monthly}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#d7e2ec" />
+                      <XAxis dataKey="monthLabel" tick={{ fontSize: 11 }} />
+                      <YAxis domain={[0, 100]} />
+                      <Tooltip />
+                      <Legend />
+                      <Line
+                        type="monotone"
+                        dataKey="estimateCoveragePercent"
+                        name="Покрытие оценкой %"
+                        stroke="#2563eb"
+                        strokeWidth={2.2}
+                        dot={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="urgentSharePercent"
+                        name="Срочные задачи %"
+                        stroke="#f59e0b"
+                        strokeWidth={2.2}
+                        dot={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="bugSharePercent"
+                        name="Доля багов %"
+                        stroke="#dc2626"
+                        strokeWidth={2.2}
+                        dot={false}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </article>
+
+              <article className="card chart-card">
+                <p className="card-title">Денежная динамика (при введенной зарплате)</p>
+                {!hasSalary && (
+                  <p className="progress-label">
+                    Введите месячную зарплату во вкладке «Прогноз», чтобы увидеть стоимость задачи и багов по месяцам.
+                  </p>
+                )}
+                {hasSalary && (
+                  <div className="chart-wrap">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={monthlyMoneyTrend}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#d7e2ec" />
+                        <XAxis dataKey="monthLabel" tick={{ fontSize: 11 }} />
+                        <YAxis />
+                        <Tooltip />
+                        <Legend />
+                        <Line
+                          type="monotone"
+                          dataKey="costPerTask"
+                          name="Стоимость 1 задачи"
+                          stroke="#0f766e"
+                          strokeWidth={2.2}
+                          dot={false}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="bugCost"
+                          name="Стоимость багов в месяце"
+                          stroke="#7c3aed"
+                          strokeWidth={2.2}
+                          dot={false}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
               </article>
             </section>
           )}
@@ -687,7 +1077,30 @@ export default function App() {
                 </p>
                 <p>
                   Примерная стоимость одной задачи (по прогнозу следующего месяца):{' '}
-                  <strong>{formatDecimal(taskCostByForecast)}</strong>
+                  <strong>{formatMoney(taskCostByForecast)}</strong>
+                </p>
+                <p>
+                  Фактическая стоимость 1 закрытой задачи (30д): <strong>{formatMoney(costPerTask30)}</strong>
+                </p>
+                <p>
+                  Фактическая стоимость 1 закрытой задачи (90д): <strong>{formatMoney(costPerTask90)}</strong>
+                </p>
+                <p>
+                  Стоимость потока багов за 90д: <strong>{formatMoney(bugCost90)}</strong>
+                </p>
+                <p>
+                  Стоимость срочных задач High/Highest за 90д: <strong>{formatMoney(urgentCost90)}</strong>
+                </p>
+                <p>
+                  Денежная оценка текущего хвоста: <strong>{formatMoney(backlogCostExposure)}</strong>
+                </p>
+                <p>
+                  Отклонение от планового заработка на текущую дату:{' '}
+                  <strong>{formatMoney(moneyGapVsSchedule)}</strong>
+                </p>
+                <p>
+                  Премия за переработки (только коэффициент {`x${overtimeMultiplier}`}):{' '}
+                  <strong>{formatMoney(overtimePremiumCost)}</strong>
                 </p>
               </article>
             </section>
