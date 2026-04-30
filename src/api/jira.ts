@@ -12,14 +12,14 @@ const baseUrl = import.meta.env.DEV ? '/jira' : import.meta.env.VITE_JIRA_BASE_U
 const email = import.meta.env.VITE_JIRA_USER_EMAIL;
 const token = import.meta.env.VITE_JIRA_API_TOKEN;
 const authType = (import.meta.env.VITE_JIRA_AUTH_TYPE ?? 'bearer').toLowerCase();
-const assignee = import.meta.env.VITE_JIRA_ASSIGNEE ?? import.meta.env.VITE_JIRA_USER_EMAIL;
+const defaultAssignee = import.meta.env.VITE_JIRA_ASSIGNEE ?? import.meta.env.VITE_JIRA_USER_EMAIL;
 const reopenedStatuses = (import.meta.env.VITE_JIRA_REOPENED_STATUSES ?? 'Reopened')
   .split(',')
   .map((value: string) => value.trim())
   .filter(Boolean);
 const WIP_SNAPSHOT_KEY = 'jira_dashboard_wip_snapshots';
 const MAX_CONCURRENCY = 4;
-const inFlightByPeriod = new Map<number, Promise<DashboardData>>();
+const inFlightByPeriod = new Map<string, Promise<DashboardData>>();
 const competencyModel: Array<{ key: string; label: string; keywords: string[] }> = [
   {
     key: 'frontend_architecture',
@@ -84,12 +84,18 @@ function quote(value: string) {
   return `"${value.replace(/"/g, '\\"')}"`;
 }
 
-function assigneeCurrentClause() {
+function resolveAssignee(assigneeOverride?: string) {
+  const effectiveAssignee = assigneeOverride?.trim() || defaultAssignee?.trim();
+  if (!effectiveAssignee) throw new Error('Не указан VITE_JIRA_USER_EMAIL');
+  return effectiveAssignee;
+}
+
+function assigneeCurrentClause(assignee: string) {
   if (!assignee) throw new Error('Не указан VITE_JIRA_USER_EMAIL');
   return `assignee = ${quote(assignee)}`;
 }
 
-function assigneeWasClause() {
+function assigneeWasClause(assignee: string) {
   if (!assignee) throw new Error('Не указан VITE_JIRA_USER_EMAIL');
   return `assignee WAS ${quote(assignee)}`;
 }
@@ -242,8 +248,12 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-function loadWipSnapshots(): SnapshotPoint[] {
-  const raw = localStorage.getItem(WIP_SNAPSHOT_KEY);
+function getWipSnapshotKey(assignee: string) {
+  return `${WIP_SNAPSHOT_KEY}:${assignee}`;
+}
+
+function loadWipSnapshots(assignee: string): SnapshotPoint[] {
+  const raw = localStorage.getItem(getWipSnapshotKey(assignee));
   if (!raw) return [];
 
   try {
@@ -254,14 +264,14 @@ function loadWipSnapshots(): SnapshotPoint[] {
   }
 }
 
-function saveWipSnapshot(todayIso: string, wip: number): SnapshotPoint[] {
-  const snapshots = loadWipSnapshots();
+function saveWipSnapshot(assignee: string, todayIso: string, wip: number): SnapshotPoint[] {
+  const snapshots = loadWipSnapshots(assignee);
   const withoutToday = snapshots.filter((point) => point.date !== todayIso);
   const next = [...withoutToday, { date: todayIso, wip }]
     .sort((a, b) => a.date.localeCompare(b.date))
     .slice(-120);
 
-  localStorage.setItem(WIP_SNAPSHOT_KEY, JSON.stringify(next));
+  localStorage.setItem(getWipSnapshotKey(assignee), JSON.stringify(next));
   return next;
 }
 
@@ -299,11 +309,11 @@ function getCompetencyLevel(score: number): 'начальный' | 'рабочи
   return 'начальный';
 }
 
-async function fetchCompetencyStatsYear(): Promise<CompetencyStats> {
+async function fetchCompetencyStatsYear(assignee: string): Promise<CompetencyStats> {
   try {
     const pageSize = 50;
     const maxPages = 12;
-    const jql = buildJql([assigneeWasClause(), 'resolved >= -365d', 'resolved IS NOT EMPTY']);
+    const jql = buildJql([assigneeWasClause(assignee), 'resolved >= -365d', 'resolved IS NOT EMPTY']);
     let startAt = 0;
     let page = 0;
     let total = 0;
@@ -415,10 +425,10 @@ async function fetchCompetencyStatsYear(): Promise<CompetencyStats> {
   }
 }
 
-async function fetchIssueQualityStats90(): Promise<QualityStats> {
+async function fetchIssueQualityStats90(assignee: string): Promise<QualityStats> {
   const pageSize = 100;
   const maxPages = 15;
-  const jql = buildJql([assigneeWasClause(), 'resolved >= -90d']);
+  const jql = buildJql([assigneeWasClause(assignee), 'resolved >= -90d']);
 
   let startAt = 0;
   let total = 0;
@@ -479,7 +489,8 @@ async function fetchIssueQualityStats90(): Promise<QualityStats> {
 }
 
 function isWorklogByAssignee(
-  author: { emailAddress?: string; name?: string; key?: string; displayName?: string } | undefined
+  author: { emailAddress?: string; name?: string; key?: string; displayName?: string } | undefined,
+  assignee: string
 ): boolean {
   if (!author || !assignee) return false;
   const target = assignee.toLowerCase();
@@ -494,7 +505,9 @@ function isInCurrentMonthUntilToday(startedIso: string, monthStartIso: string, t
   return started >= monthStartIso && started <= todayIso;
 }
 
-async function fetchCurrentMonthWorklogStats(): Promise<{ loggedHoursCurrentMonth: number; issuesWithWorklogsCurrentMonth: number }> {
+async function fetchCurrentMonthWorklogStats(
+  assignee: string
+): Promise<{ loggedHoursCurrentMonth: number; issuesWithWorklogsCurrentMonth: number }> {
   try {
     const now = new Date();
     const start = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -576,7 +589,7 @@ async function fetchCurrentMonthWorklogStats(): Promise<{ loggedHoursCurrentMont
           .filter((entry) => {
             if (!entry.started || !entry.timeSpentSeconds) return false;
             return (
-              isWorklogByAssignee(entry.author) &&
+              isWorklogByAssignee(entry.author, assignee) &&
               isInCurrentMonthUntilToday(entry.started, monthStartIso, todayIso)
             );
           })
@@ -609,86 +622,87 @@ async function fetchCurrentMonthWorklogStats(): Promise<{ loggedHoursCurrentMont
   }
 }
 
-async function buildDashboardData(periodMonths: number): Promise<DashboardData> {
+async function buildDashboardData(periodMonths: number, assigneeOverride?: string): Promise<DashboardData> {
+  const assignee = resolveAssignee(assigneeOverride);
   const metricsPlan: Array<{ key: string; label: string; jql: string }> = [
-    { key: 'allCurrent', label: 'Текущие на мне', jql: buildJql([assigneeCurrentClause()]) },
-    { key: 'allEver', label: 'Были на мне (история)', jql: buildJql([assigneeWasClause()]) },
-    { key: 'doneAll', label: 'Выполненные всего', jql: buildJql([assigneeWasClause(), 'resolved IS NOT EMPTY']) },
-    { key: 'throughput30', label: 'Resolved за 30д', jql: buildJql([assigneeWasClause(), 'resolved >= -30d']) },
-    { key: 'throughput180', label: 'Resolved за 180д', jql: buildJql([assigneeWasClause(), 'resolved >= -180d']) },
-    { key: 'throughput365', label: 'Resolved за 365д', jql: buildJql([assigneeWasClause(), 'resolved >= -365d']) },
+    { key: 'allCurrent', label: 'Текущие на мне', jql: buildJql([assigneeCurrentClause(assignee)]) },
+    { key: 'allEver', label: 'Были на мне (история)', jql: buildJql([assigneeWasClause(assignee)]) },
+    { key: 'doneAll', label: 'Выполненные всего', jql: buildJql([assigneeWasClause(assignee), 'resolved IS NOT EMPTY']) },
+    { key: 'throughput30', label: 'Resolved за 30д', jql: buildJql([assigneeWasClause(assignee), 'resolved >= -30d']) },
+    { key: 'throughput180', label: 'Resolved за 180д', jql: buildJql([assigneeWasClause(assignee), 'resolved >= -180d']) },
+    { key: 'throughput365', label: 'Resolved за 365д', jql: buildJql([assigneeWasClause(assignee), 'resolved >= -365d']) },
     {
       key: 'withEstimate30',
       label: 'Resolved с оценкой за 30д',
-      jql: buildJql([assigneeWasClause(), 'resolved >= -30d', 'timeoriginalestimate IS NOT EMPTY'])
+      jql: buildJql([assigneeWasClause(assignee), 'resolved >= -30d', 'timeoriginalestimate IS NOT EMPTY'])
     },
     {
       key: 'withEstimate180',
       label: 'Resolved с оценкой за 180д',
-      jql: buildJql([assigneeWasClause(), 'resolved >= -180d', 'timeoriginalestimate IS NOT EMPTY'])
+      jql: buildJql([assigneeWasClause(assignee), 'resolved >= -180d', 'timeoriginalestimate IS NOT EMPTY'])
     },
     {
       key: 'withEstimate90',
       label: 'Resolved с оценкой за 90д',
-      jql: buildJql([assigneeWasClause(), 'resolved >= -90d', 'timeoriginalestimate IS NOT EMPTY'])
+      jql: buildJql([assigneeWasClause(assignee), 'resolved >= -90d', 'timeoriginalestimate IS NOT EMPTY'])
     },
     {
       key: 'withEstimate365',
       label: 'Resolved с оценкой за 365д',
-      jql: buildJql([assigneeWasClause(), 'resolved >= -365d', 'timeoriginalestimate IS NOT EMPTY'])
+      jql: buildJql([assigneeWasClause(assignee), 'resolved >= -365d', 'timeoriginalestimate IS NOT EMPTY'])
     },
-    { key: 'throughput90', label: 'Resolved за 90д', jql: buildJql([assigneeWasClause(), 'resolved >= -90d']) },
+    { key: 'throughput90', label: 'Resolved за 90д', jql: buildJql([assigneeWasClause(assignee), 'resolved >= -90d']) },
     {
       key: 'wipNow',
       label: 'WIP сейчас',
-      jql: buildJql([assigneeCurrentClause(), 'statusCategory != Done'])
+      jql: buildJql([assigneeCurrentClause(assignee), 'statusCategory != Done'])
     },
     {
       key: 'wipInProgress',
       label: 'In Progress',
-      jql: buildJql([assigneeCurrentClause(), 'statusCategory = "In Progress"'])
+      jql: buildJql([assigneeCurrentClause(assignee), 'statusCategory = "In Progress"'])
     },
     {
       key: 'stale14',
       label: 'Залипшие 14д',
-      jql: buildJql([assigneeCurrentClause(), 'statusCategory != Done', 'updated <= -14d'])
+      jql: buildJql([assigneeCurrentClause(assignee), 'statusCategory != Done', 'updated <= -14d'])
     },
     {
       key: 'bugs90',
       label: 'Закрытые баги 90д',
-      jql: buildJql(['issuetype = Bug', assigneeWasClause(), 'resolved >= -90d'])
+      jql: buildJql(['issuetype = Bug', assigneeWasClause(assignee), 'resolved >= -90d'])
     },
     {
       key: 'reopened90',
       label: 'Переоткрытия 90д',
-      jql: buildJql([assigneeWasClause(), `(${reopenedStatuses
+      jql: buildJql([assigneeWasClause(assignee), `(${reopenedStatuses
         .map((status: string) => `status CHANGED TO ${quote(status)} DURING (-90d, now())`)
         .join(' OR ')})`])
     },
     {
       key: 'fires90',
       label: 'High/Highest 90д',
-      jql: buildJql([assigneeWasClause(), 'resolved >= -90d', 'priority IN (Highest, High)'])
+      jql: buildJql([assigneeWasClause(assignee), 'resolved >= -90d', 'priority IN (Highest, High)'])
     },
     {
       key: 'hotfix90',
       label: 'Hotfix/Prod 90д',
-      jql: buildJql([assigneeWasClause(), 'resolved >= -90d', 'labels IN (hotfix, prod)'])
+      jql: buildJql([assigneeWasClause(assignee), 'resolved >= -90d', 'labels IN (hotfix, prod)'])
     },
     {
       key: 'closedEpicsYear',
       label: 'Epics за год',
-      jql: buildJql(['issuetype = Epic', assigneeWasClause(), 'resolved >= -365d'])
+      jql: buildJql(['issuetype = Epic', assigneeWasClause(assignee), 'resolved >= -365d'])
     },
     {
       key: 'substantialYear',
       label: 'Существенные >=8ч за год',
-      jql: buildJql([assigneeWasClause(), 'resolved >= -365d', 'timespent >= 28800'])
+      jql: buildJql([assigneeWasClause(assignee), 'resolved >= -365d', 'timespent >= 28800'])
     },
     {
       key: 'speed6weeks',
       label: 'Resolved за 6 недель',
-      jql: buildJql([assigneeWasClause(), 'resolved >= -42d'])
+      jql: buildJql([assigneeWasClause(assignee), 'resolved >= -42d'])
     }
   ];
 
@@ -703,29 +717,29 @@ async function buildDashboardData(periodMonths: number): Promise<DashboardData> 
   const buckets = buildMonthBuckets(periodMonths);
   const monthlyRaw = await mapWithConcurrency(buckets, MAX_CONCURRENCY, async (bucket) => {
       const resolvedJql = buildJql([
-        assigneeWasClause(),
+        assigneeWasClause(assignee),
         `resolved >= ${quote(bucket.start)}`,
         `resolved < ${quote(bucket.next)}`
       ]);
       const createdJql = buildJql([
-        assigneeWasClause(),
+        assigneeWasClause(assignee),
         `created >= ${quote(bucket.start)}`,
         `created < ${quote(bucket.next)}`
       ]);
       const bugsJql = buildJql([
         'issuetype = Bug',
-        assigneeWasClause(),
+        assigneeWasClause(assignee),
         `resolved >= ${quote(bucket.start)}`,
         `resolved < ${quote(bucket.next)}`
       ]);
       const withEstimateJql = buildJql([
-        assigneeWasClause(),
+        assigneeWasClause(assignee),
         `resolved >= ${quote(bucket.start)}`,
         `resolved < ${quote(bucket.next)}`,
         'timeoriginalestimate IS NOT EMPTY'
       ]);
       const highPriorityJql = buildJql([
-        assigneeWasClause(),
+        assigneeWasClause(assignee),
         `resolved >= ${quote(bucket.start)}`,
         `resolved < ${quote(bucket.next)}`,
         'priority IN (Highest, High)'
@@ -761,7 +775,7 @@ async function buildDashboardData(periodMonths: number): Promise<DashboardData> 
     ma6: ma6[index]
   }));
 
-  const qualityStats = await fetchIssueQualityStats90();
+  const qualityStats = await fetchIssueQualityStats90(assignee);
   const throughput90 = metricValue('throughput90');
   const resolvedWithEstimate90 = qualityStats.resolvedWithEstimate;
   const noEstimate90 = qualityStats.noEstimateWithSpent;
@@ -847,8 +861,8 @@ async function buildDashboardData(periodMonths: number): Promise<DashboardData> 
     makeVolumeAssessment('За полгода', metricValue('throughput180'), metricValue('withEstimate180'), 6),
     makeVolumeAssessment('За год', metricValue('throughput365'), metricValue('withEstimate365'), 12)
   ];
-  const worklog = await fetchCurrentMonthWorklogStats();
-  const competency = await fetchCompetencyStatsYear();
+  const worklog = await fetchCurrentMonthWorklogStats(assignee);
+  const competency = await fetchCompetencyStatsYear(assignee);
   const bugRate90 = throughput90 > 0 ? (metricValue('bugs90') / throughput90) * 100 : 0;
   const reopenedRate90 = throughput90 > 0 ? (metricValue('reopened90') / throughput90) * 100 : 0;
   const throughput365 = metricValue('throughput365');
@@ -895,11 +909,24 @@ async function buildDashboardData(periodMonths: number): Promise<DashboardData> 
   const etaScore = clamp(100 - (median > 0 ? median * 8 : 100), 0, 100);
   const deliveryScore = round2((trendScore + etaScore) / 2);
   const overallCoreScore = round2((predictabilityScore + qualityScore + flowScore + deliveryScore) / 4);
+  const dismissalRiskPercent = round2(
+    clamp(
+      (100 - overallCoreScore) * 0.4 +
+        (100 - qualityScore) * 0.2 +
+        (100 - predictabilityScore) * 0.15 +
+        clamp(staleRate * 1.5, 0, 100) * 0.1 +
+        clamp(reopenedRate90 * 4, 0, 100) * 0.1 +
+        clamp(Math.max(wipPressureWeeks - 2, 0) * 12.5, 0, 100) * 0.05,
+      0,
+      100
+    )
+  );
 
   const today = new Date().toISOString().slice(0, 10);
-  const snapshots = saveWipSnapshot(today, backlog);
+  const snapshots = saveWipSnapshot(assignee, today, backlog);
 
   return {
+    assignee,
     fetchedAt: new Date().toISOString(),
     periodMonths,
     metrics,
@@ -930,23 +957,26 @@ async function buildDashboardData(periodMonths: number): Promise<DashboardData> 
       qualityScore,
       flowScore,
       deliveryScore,
-      overallCoreScore
+      overallCoreScore,
+      dismissalRiskPercent
     },
     personal,
     competency
   };
 }
 
-export async function fetchDashboardData(periodMonths: number): Promise<DashboardData> {
-  const inFlight = inFlightByPeriod.get(periodMonths);
+export async function fetchDashboardData(periodMonths: number, assigneeOverride?: string): Promise<DashboardData> {
+  const assignee = resolveAssignee(assigneeOverride);
+  const cacheKey = `${periodMonths}:${assignee}`;
+  const inFlight = inFlightByPeriod.get(cacheKey);
   if (inFlight) return inFlight;
 
-  const promise = buildDashboardData(periodMonths);
-  inFlightByPeriod.set(periodMonths, promise);
+  const promise = buildDashboardData(periodMonths, assignee);
+  inFlightByPeriod.set(cacheKey, promise);
 
   try {
     return await promise;
   } finally {
-    inFlightByPeriod.delete(periodMonths);
+    inFlightByPeriod.delete(cacheKey);
   }
 }

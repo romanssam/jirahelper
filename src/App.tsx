@@ -1,6 +1,6 @@
 import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bar,
   BarChart,
@@ -24,13 +24,38 @@ import { fetchDashboardData } from './api/jira';
 import type { AiAssessment, DashboardData, MetricPoint } from './types';
 import { calculateWorkHours } from './utils/hours';
 
-type View = 'overview' | 'analytics' | 'forecast';
+type View = 'overview' | 'analytics' | 'forecast' | 'compare';
+type PdfView = 'overview' | 'analytics';
 
 const periodOptions = [
   { value: 12, label: '1 год' },
   { value: 24, label: '2 года' },
   { value: 60, label: '5 лет' }
 ];
+
+const jiraUserOptions = [
+  'r.samotischuk@wellsoft.pro',
+  's.trostnitskiy@wellsoft.pro',
+  's.altushkin',
+  'a.okosten',
+  's.kuznetsov',
+  'e.antonov',
+  'a.zhuravlev',
+  's.koromyslov',
+  'g.shusharin'
+] as const;
+
+const defaultJiraUser =
+  jiraUserOptions.find((user) => user === import.meta.env.VITE_JIRA_ASSIGNEE) ?? jiraUserOptions[0];
+
+const compareMetricOptions = [
+  { key: 'throughput30', label: 'Resolved за 30 дней', hint: 'Сколько задач было закрыто за последние 30 дней.' },
+  { key: 'throughput90', label: 'Resolved за 90 дней', hint: 'Сколько задач было закрыто за последние 90 дней.' },
+  { key: 'wipNow', label: 'Текущий WIP', hint: 'Текущее количество незавершенных задач на сотруднике.' },
+  { key: 'stale14', label: 'Залипшие 14д', hint: 'Незавершенные задачи без обновлений дольше 14 дней.' },
+  { key: 'bugs90', label: 'Баги за 90 дней', hint: 'Сколько багов было закрыто за последние 90 дней.' },
+  { key: 'fires90', label: 'High/Highest за 90 дней', hint: 'Сколько срочных задач с высоким приоритетом было закрыто за 90 дней.' }
+] as const;
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('ru-RU').format(value);
@@ -103,8 +128,121 @@ function getWipPressureAssessment(value: number): string {
   return 'риск';
 }
 
+function clampValue(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function roundScore(value: number): number {
+  return Number(value.toFixed(2));
+}
+
+function getResponsibilityClarityScore(data: DashboardData): number {
+  const estimateCoverage = data.personal.estimateCoverage90Percent;
+  const focus = metricByKey(data.metrics, 'wipNow') > 0 ? data.personal.executionFocusPercent : 100;
+  const staleHealth = clampValue(100 - data.personal.staleShareCurrentPercent, 0, 100);
+  const reopenHealth = clampValue(100 - data.personal.reopenRate90Percent * 2, 0, 100);
+
+  return roundScore(estimateCoverage * 0.3 + focus * 0.25 + staleHealth * 0.25 + reopenHealth * 0.2);
+}
+
+function getEndToEndOwnershipScore(data: DashboardData): number {
+  const stability = data.personal.deliveryStabilityIndex;
+  const initiative = clampValue(data.personal.initiativeShareYearPercent * 4, 0, 100);
+  const complexity = clampValue(data.personal.complexityShareYearPercent * 2, 0, 100);
+  const quality = clampValue(100 - data.personal.reopenRate90Percent * 2, 0, 100);
+
+  return roundScore(stability * 0.35 + initiative * 0.2 + complexity * 0.2 + quality * 0.25);
+}
+
+function getContextSwitchingIndex(data: DashboardData): number {
+  const activeWork = metricByKey(data.metrics, 'wipInProgress');
+  const currentBacklog = metricByKey(data.metrics, 'wipNow');
+  const urgentShare = data.personal.urgentLoadShare90Percent;
+
+  return roundScore(activeWork * 1.4 + Math.max(currentBacklog - activeWork, 0) * 0.7 + urgentShare * 0.08);
+}
+
 function metricByKey(metrics: MetricPoint[], key: string): number {
   return metrics.find((metric) => metric.key === key)?.total ?? 0;
+}
+
+function formatDelta(value: number): string {
+  if (value === 0) return '0';
+  return `${value > 0 ? '+' : ''}${formatNumber(value)}`;
+}
+
+function formatPercent(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return 'нет данных';
+  return `${formatDecimal(value)}%`;
+}
+
+function getDismissalRiskLabel(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return 'нет данных';
+  if (value < 25) return 'низкий';
+  if (value < 50) return 'умеренный';
+  if (value < 70) return 'высокий';
+  return 'критический';
+}
+
+function sumMonthly(data: DashboardData, key: 'created' | 'resolved'): number {
+  return data.monthly.reduce((sum, row) => sum + row[key], 0);
+}
+
+function averagePerMonth(data: DashboardData, key: 'created' | 'resolved'): number {
+  return data.monthly.length > 0 ? Number((sumMonthly(data, key) / data.monthly.length).toFixed(2)) : 0;
+}
+
+function conversionPercent(data: DashboardData): number | null {
+  const created = sumMonthly(data, 'created');
+  const resolved = sumMonthly(data, 'resolved');
+  return created > 0 ? Number(((resolved / created) * 100).toFixed(2)) : null;
+}
+
+function getCompareNarrative(data: DashboardData, peer: DashboardData): string[] {
+  const notes: string[] = [];
+  const resolved = sumMonthly(data, 'resolved');
+  const peerResolved = sumMonthly(peer, 'resolved');
+  const reopen = data.personal.reopenRate90Percent;
+  const peerReopen = peer.personal.reopenRate90Percent;
+  const stale = metricByKey(data.metrics, 'stale14');
+  const worklog = data.worklog.loggedHoursCurrentMonth;
+  const peerWorklog = peer.worklog.loggedHoursCurrentMonth;
+
+  if (resolved > peerResolved) {
+    notes.push(`выше темп закрытия за период: ${formatNumber(resolved)} против ${formatNumber(peerResolved)}`);
+  } else if (resolved < peerResolved) {
+    notes.push(`ниже темп закрытия за период: ${formatNumber(resolved)} против ${formatNumber(peerResolved)}`);
+  } else {
+    notes.push(`паритет по закрытию за период: по ${formatNumber(resolved)} задач`);
+  }
+
+  if (reopen < peerReopen) {
+    notes.push(`лучше по возвратам за 90 дней: ${formatPercent(reopen)} против ${formatPercent(peerReopen)}`);
+  } else if (reopen > peerReopen) {
+    notes.push(`хуже по возвратам за 90 дней: ${formatPercent(reopen)} против ${formatPercent(peerReopen)}`);
+  }
+
+  if (stale > 0) {
+    notes.push(`в хвосте ${formatNumber(stale)} зависших задач старше 14 дней`);
+  }
+
+  if (worklog > 0 && peerWorklog > 0) {
+    const productivity = resolved / worklog;
+    const peerProductivity = peerResolved / peerWorklog;
+    if (productivity < peerProductivity * 0.7) {
+      notes.push('конвертация часов в закрытие задач заметно ниже, чем у второго сотрудника');
+    }
+  }
+
+  if (data.characteristics.dismissalRiskPercent >= 50) {
+    notes.push(
+      `эвристический риск увольнения: ${formatPercent(data.characteristics.dismissalRiskPercent)} (${getDismissalRiskLabel(
+        data.characteristics.dismissalRiskPercent
+      )})`
+    );
+  }
+
+  return notes.slice(0, 4);
 }
 
 function toCsv(data: DashboardData): string {
@@ -234,15 +372,21 @@ export default function App() {
   const [view, setView] = useState<View>('overview');
   const [periodMonths, setPeriodMonths] = useState(12);
   const [reloadNonce, setReloadNonce] = useState(0);
+  const [selectedAssignee, setSelectedAssignee] = useState<string>(defaultJiraUser);
+  const [compareAssigneeLeft, setCompareAssigneeLeft] = useState<string>(defaultJiraUser);
+  const [compareAssigneeRight, setCompareAssigneeRight] = useState<string>(jiraUserOptions[1] ?? defaultJiraUser);
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [comparePair, setComparePair] = useState<[DashboardData | null, DashboardData | null]>([null, null]);
+  const [compareLoading, setCompareLoading] = useState(false);
+  const [compareError, setCompareError] = useState<string | null>(null);
   const [aiAssessment, setAiAssessment] = useState<AiAssessment | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [salaryInput, setSalaryInput] = useState('');
   const [overtimeMultiplier, setOvertimeMultiplier] = useState(1);
-  const [pdfExporting, setPdfExporting] = useState<View | null>(null);
+  const [pdfExporting, setPdfExporting] = useState<PdfView | null>(null);
   const overviewSectionRef = useRef<HTMLElement | null>(null);
   const analyticsSectionRef = useRef<HTMLElement | null>(null);
 
@@ -254,9 +398,11 @@ export default function App() {
     async function load() {
       setLoading(true);
       setError(null);
+      setAiAssessment(null);
+      setAiError(null);
 
       try {
-        const next = await fetchDashboardData(periodMonths);
+        const next = await fetchDashboardData(periodMonths, selectedAssignee);
         if (!cancelled) setData(next);
       } catch (err) {
         if (!cancelled) {
@@ -272,7 +418,38 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [periodMonths, reloadNonce]);
+  }, [periodMonths, reloadNonce, selectedAssignee]);
+
+  useEffect(() => {
+    if (view !== 'compare') return;
+
+    let cancelled = false;
+
+    async function loadComparison() {
+      setCompareLoading(true);
+      setCompareError(null);
+
+      try {
+        const next = await Promise.all([
+          fetchDashboardData(periodMonths, compareAssigneeLeft),
+          fetchDashboardData(periodMonths, compareAssigneeRight)
+        ]);
+        if (!cancelled) setComparePair([next[0], next[1]]);
+      } catch (err) {
+        if (!cancelled) {
+          setCompareError(err instanceof Error ? err.message : 'Ошибка загрузки сравнения');
+        }
+      } finally {
+        if (!cancelled) setCompareLoading(false);
+      }
+    }
+
+    void loadComparison();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [view, periodMonths, reloadNonce, compareAssigneeLeft, compareAssigneeRight]);
 
   const summaryCards = data
     ? [
@@ -337,6 +514,298 @@ export default function App() {
       })) ?? [],
     [data]
   );
+  const [compareDataLeft, compareDataRight] = comparePair;
+  const compareSummaryCards = useMemo(() => {
+    if (!compareDataLeft || !compareDataRight) return [];
+
+    return [
+      {
+        label: 'Core score',
+        hint: 'Средний базовый рейтинг по четырем сигналам Jira: предсказуемость, качество, поток и доставка. Чем выше, тем стабильнее и здоровее процесс.',
+        left: compareDataLeft.characteristics.overallCoreScore,
+        right: compareDataRight.characteristics.overallCoreScore,
+        formatter: formatDecimal
+      },
+      {
+        label: 'Resolved за 90 дней',
+        hint: 'Сколько задач было закрыто за последние 90 дней.',
+        left: metricByKey(compareDataLeft.metrics, 'throughput90'),
+        right: metricByKey(compareDataRight.metrics, 'throughput90'),
+        formatter: formatDecimal
+      },
+      {
+        label: 'Текущий WIP',
+        hint: 'Текущее количество незавершенных задач на сотруднике.',
+        left: metricByKey(compareDataLeft.metrics, 'wipNow'),
+        right: metricByKey(compareDataRight.metrics, 'wipNow'),
+        formatter: formatDecimal
+      },
+      {
+        label: 'Worklog часов за месяц',
+        hint: 'Сколько часов сотрудник списал в Jira worklog в текущем месяце.',
+        left: compareDataLeft.worklog.loggedHoursCurrentMonth,
+        right: compareDataRight.worklog.loggedHoursCurrentMonth,
+        formatter: formatDecimal
+      },
+      {
+        label: 'Ясность ответственности',
+        hint: 'Прокси 0-100% для RACI-подобного анализа: есть ли оценки/критерии, сфокусирован ли текущий WIP, нет ли залипаний и переоткрытий.',
+        left: getResponsibilityClarityScore(compareDataLeft),
+        right: getResponsibilityClarityScore(compareDataRight),
+        formatter: formatPercent
+      },
+      {
+        label: 'Риск увольнения',
+        hint: 'Эвристический риск-индекс 0-100% по Jira-метрикам: качество, предсказуемость, хвост, переоткрытия и давление WIP. Это не HR-вердикт.',
+        left: compareDataLeft.characteristics.dismissalRiskPercent,
+        right: compareDataRight.characteristics.dismissalRiskPercent,
+        formatter: formatPercent
+      }
+    ];
+  }, [compareDataLeft, compareDataRight]);
+  const compareMetricRows = useMemo(() => {
+    if (!compareDataLeft || !compareDataRight) return [];
+
+    return compareMetricOptions.map((metric) => {
+      const left = metricByKey(compareDataLeft.metrics, metric.key);
+      const right = metricByKey(compareDataRight.metrics, metric.key);
+      return {
+        label: metric.label,
+        hint: metric.hint,
+        left,
+        right,
+        delta: left - right
+      };
+    });
+  }, [compareDataLeft, compareDataRight]);
+  const compareTrendData = useMemo(() => {
+    if (!compareDataLeft || !compareDataRight) return [];
+
+    return compareDataLeft.monthly.map((leftMonth, index) => {
+      const rightMonth = compareDataRight.monthly[index];
+      return {
+        monthLabel: leftMonth.monthLabel,
+        leftResolved: leftMonth.resolved,
+        rightResolved: rightMonth?.resolved ?? 0,
+        leftCreated: leftMonth.created,
+        rightCreated: rightMonth?.created ?? 0
+      };
+    });
+  }, [compareDataLeft, compareDataRight]);
+  const compareMonthlyRows = useMemo(() => {
+    if (!compareDataLeft || !compareDataRight) return [];
+
+    return compareDataLeft.monthly.map((leftMonth, index) => {
+      const rightMonth = compareDataRight.monthly[index];
+      return {
+        monthLabel: leftMonth.monthLabel,
+        leftCreated: leftMonth.created,
+        leftResolved: leftMonth.resolved,
+        rightCreated: rightMonth?.created ?? 0,
+        rightResolved: rightMonth?.resolved ?? 0
+      };
+    });
+  }, [compareDataLeft, compareDataRight]);
+  const compareSpeedRows = useMemo(() => {
+    if (!compareDataLeft || !compareDataRight) return [];
+
+    return [
+      {
+        label: 'Закрыто за период',
+        hint: 'Сумма resolved по всем месяцам выбранного периода.',
+        left: sumMonthly(compareDataLeft, 'resolved'),
+        right: sumMonthly(compareDataRight, 'resolved'),
+        formatter: (value: number | null) => formatNumber(value ?? 0)
+      },
+      {
+        label: 'Среднее закрытие в месяц',
+        hint: 'Среднее количество resolved в месяц по текущему периоду.',
+        left: averagePerMonth(compareDataLeft, 'resolved'),
+        right: averagePerMonth(compareDataRight, 'resolved'),
+        formatter: (value: number | null) => formatDecimal(value)
+      },
+      {
+        label: 'Создано за период',
+        hint: 'Сумма created по всем месяцам выбранного периода.',
+        left: sumMonthly(compareDataLeft, 'created'),
+        right: sumMonthly(compareDataRight, 'created'),
+        formatter: (value: number | null) => formatNumber(value ?? 0)
+      },
+      {
+        label: 'Конверсия closed/created',
+        hint: 'Отношение закрытых задач к созданным в выбранном периоде.',
+        left: conversionPercent(compareDataLeft),
+        right: conversionPercent(compareDataRight),
+        formatter: (value: number | null) => formatPercent(value)
+      },
+      {
+        label: 'Rate переоткрытий 90д',
+        hint: 'Доля переоткрытых задач среди закрытых за последние 90 дней.',
+        left: compareDataLeft.personal.reopenRate90Percent,
+        right: compareDataRight.personal.reopenRate90Percent,
+        formatter: (value: number | null) => formatPercent(value)
+      },
+      {
+        label: 'Индекс стабильности delivery',
+        hint: 'Насколько темп последних 30 дней близок к базовому темпу 90 дней.',
+        left: compareDataLeft.personal.deliveryStabilityIndex,
+        right: compareDataRight.personal.deliveryStabilityIndex,
+        formatter: (value: number | null) => formatPercent(value)
+      }
+    ];
+  }, [compareDataLeft, compareDataRight]);
+  const compareBacklogRows = useMemo(() => {
+    if (!compareDataLeft || !compareDataRight) return [];
+
+    return [
+      {
+        label: 'Открытых незавершённых',
+        hint: 'Все текущие задачи в статусах не Done.',
+        left: metricByKey(compareDataLeft.metrics, 'wipNow'),
+        right: metricByKey(compareDataRight.metrics, 'wipNow'),
+        formatter: (value: number | null) => formatNumber(value ?? 0)
+      },
+      {
+        label: 'В работе',
+        hint: 'Текущие задачи в статусной категории In Progress.',
+        left: metricByKey(compareDataLeft.metrics, 'wipInProgress'),
+        right: metricByKey(compareDataRight.metrics, 'wipInProgress'),
+        formatter: (value: number | null) => formatNumber(value ?? 0)
+      },
+      {
+        label: 'Зависшие 14д',
+        hint: 'Незавершённые задачи без обновлений дольше 14 дней.',
+        left: metricByKey(compareDataLeft.metrics, 'stale14'),
+        right: metricByKey(compareDataRight.metrics, 'stale14'),
+        formatter: (value: number | null) => formatNumber(value ?? 0)
+      },
+      {
+        label: 'Фокус на исполнении',
+        hint: 'Доля задач In Progress внутри текущего хвоста.',
+        left: compareDataLeft.personal.executionFocusPercent,
+        right: compareDataRight.personal.executionFocusPercent,
+        formatter: (value: number | null) => formatPercent(value)
+      },
+      {
+        label: 'Давление WIP, недель',
+        hint: 'За сколько недель можно разгрести текущий хвост при темпе 90 дней.',
+        left: compareDataLeft.personal.wipPressureWeeks,
+        right: compareDataRight.personal.wipPressureWeeks,
+        formatter: (value: number | null) => formatDecimal(value)
+      }
+    ];
+  }, [compareDataLeft, compareDataRight]);
+  const compareResponsibilityRows = useMemo(() => {
+    if (!compareDataLeft || !compareDataRight) return [];
+
+    return [
+      {
+        label: 'Ясность ответственности',
+        hint: 'Прокси 0-100%: оцененность задач, фокус текущей работы, отсутствие залипаний и переоткрытий. Чем выше, тем понятнее зона ответственности и критерии результата.',
+        left: getResponsibilityClarityScore(compareDataLeft),
+        right: getResponsibilityClarityScore(compareDataRight),
+        formatter: (value: number | null) => formatPercent(value)
+      },
+      {
+        label: 'Ownership результата end-to-end',
+        hint: 'Прокси 0-100%: стабильность доставки, доля инициатив/эпиков, существенные задачи и низкие переоткрытия. Показывает, насколько сотрудник доводит заметный результат от начала до конца.',
+        left: getEndToEndOwnershipScore(compareDataLeft),
+        right: getEndToEndOwnershipScore(compareDataRight),
+        formatter: (value: number | null) => formatPercent(value)
+      },
+      {
+        label: 'Ширина роли',
+        hint: 'Количество распознанных компетентностных направлений за год. Помогает увидеть, роль узкая или человек закрывает несколько типов работ.',
+        left: compareDataLeft.personal.competencyBreadth,
+        right: compareDataRight.personal.competencyBreadth,
+        formatter: (value: number | null) => formatNumber(value ?? 0)
+      },
+      {
+        label: 'Покрытие компетенций',
+        hint: 'Доля задач за год, которые попали в распознанные компетентностные категории. Чем выше, тем понятнее вклад и рабочий профиль.',
+        left: compareDataLeft.personal.competencyCoveragePercent,
+        right: compareDataRight.personal.competencyCoveragePercent,
+        formatter: (value: number | null) => formatPercent(value)
+      },
+      {
+        label: 'Индекс переключений контекста',
+        hint: 'Прокси на основе активного WIP, незавершенного хвоста и срочных задач. Чем выше, тем больше риск распыления и потери фокуса.',
+        left: getContextSwitchingIndex(compareDataLeft),
+        right: getContextSwitchingIndex(compareDataRight),
+        formatter: (value: number | null) => formatDecimal(value)
+      },
+      {
+        label: 'Нагрузка относительно темпа, недель',
+        hint: 'Сколько недель нужно, чтобы закрыть текущий хвост при темпе последних 90 дней. Показывает, соответствует ли объем работы возможностям.',
+        left: compareDataLeft.personal.wipPressureWeeks,
+        right: compareDataRight.personal.wipPressureWeeks,
+        formatter: (value: number | null) => formatDecimal(value)
+      },
+      {
+        label: 'Доля залипших задач',
+        hint: 'Доля текущего хвоста без обновлений дольше 14 дней. Это сигнал неясного owner, зависимостей или несогласованной работы.',
+        left: compareDataLeft.personal.staleShareCurrentPercent,
+        right: compareDataRight.personal.staleShareCurrentPercent,
+        formatter: (value: number | null) => formatPercent(value)
+      }
+    ];
+  }, [compareDataLeft, compareDataRight]);
+  const compareScoreRows = useMemo(() => {
+    if (!compareDataLeft || !compareDataRight) return [];
+
+    return [
+      {
+        label: 'Предсказуемость',
+        left: compareDataLeft.characteristics.predictabilityScore,
+        right: compareDataRight.characteristics.predictabilityScore,
+        formatter: formatDecimal
+      },
+      {
+        label: 'Качество',
+        left: compareDataLeft.characteristics.qualityScore,
+        right: compareDataRight.characteristics.qualityScore,
+        formatter: formatDecimal
+      },
+      {
+        label: 'Поток',
+        left: compareDataLeft.characteristics.flowScore,
+        right: compareDataRight.characteristics.flowScore,
+        formatter: formatDecimal
+      },
+      {
+        label: 'Доставка',
+        left: compareDataLeft.characteristics.deliveryScore,
+        right: compareDataRight.characteristics.deliveryScore,
+        formatter: formatDecimal
+      },
+      {
+        label: 'Компетентностный охват',
+        left: compareDataLeft.personal.competencyCoveragePercent,
+        right: compareDataRight.personal.competencyCoveragePercent,
+        formatter: formatPercent
+      },
+      {
+        label: 'Итоговый core score',
+        left: compareDataLeft.characteristics.overallCoreScore,
+        right: compareDataRight.characteristics.overallCoreScore,
+        formatter: formatDecimal
+      },
+      {
+        label: 'Риск увольнения, %',
+        left: compareDataLeft.characteristics.dismissalRiskPercent,
+        right: compareDataRight.characteristics.dismissalRiskPercent,
+        formatter: formatPercent
+      }
+    ];
+  }, [compareDataLeft, compareDataRight]);
+  const compareNarratives = useMemo(() => {
+    if (!compareDataLeft || !compareDataRight) return null;
+
+    return {
+      left: getCompareNarrative(compareDataLeft, compareDataRight),
+      right: getCompareNarrative(compareDataRight, compareDataLeft)
+    };
+  }, [compareDataLeft, compareDataRight]);
 
   async function handleAiAssessment() {
     if (!data) return;
@@ -361,7 +830,7 @@ export default function App() {
     }
   }
 
-  async function handleExportPdf(targetView: View) {
+  async function handleExportPdf(targetView: PdfView) {
     if (!data || loading) return;
     const previousView = view;
     setPdfExporting(targetView);
@@ -395,7 +864,7 @@ export default function App() {
 
   return (
     <div className="page">
-      <header className="hero">
+<header className="hero">
         <div>
           <p className="eyebrow">JIRA Metrics Hub</p>
           <h1>Дашборд загрузки, качества и прогнозов</h1>
@@ -403,11 +872,22 @@ export default function App() {
             Агрегаты строятся по вашим JQL через `total`, плюс тренды по месяцам, ETA хвоста и
             качество оценки.
           </p>
+          <p className="subtitle subtitle-compact">Текущий assignee: {selectedAssignee}</p>
         </div>
       </header>
 
       <section className="toolbar card">
         <div className="toolbar-left">
+          <label className="field">
+            Jira user
+            <select value={selectedAssignee} onChange={(event) => setSelectedAssignee(event.target.value)}>
+              {jiraUserOptions.map((user) => (
+                <option key={user} value={user}>
+                  {user}
+                </option>
+              ))}
+            </select>
+          </label>
           <label className="field">
             Период графиков
             <select value={periodMonths} onChange={(event) => setPeriodMonths(Number(event.target.value))}>
@@ -472,13 +952,274 @@ export default function App() {
         <button className={view === 'forecast' ? 'tab active' : 'tab'} onClick={() => setView('forecast')}>
           Прогноз
         </button>
+        <button className={view === 'compare' ? 'tab active' : 'tab'} onClick={() => setView('compare')}>
+          Сравнение
+        </button>
       </nav>
 
       {loading && <div className="state-card">Тяну данные из Jira, это может занять время...</div>}
       {error && <div className="state-card error">{error}</div>}
+      {compareError && view === 'compare' && <div className="state-card error">{compareError}</div>}
       {aiError && <div className="state-card error">{aiError}</div>}
 
-      {!loading && !error && data && (
+      {view === 'compare' && (
+        <main className="content">
+          <section className="grid compare-toolbar-grid">
+            <article className="card compare-config-card">
+              <p className="card-title">Сравнение сотрудников</p>
+              <div className="compare-selects">
+                <label className="field">
+                  Пользователь слева
+                  <select value={compareAssigneeLeft} onChange={(event) => setCompareAssigneeLeft(event.target.value)}>
+                    {jiraUserOptions.map((user) => (
+                      <option key={`left-${user}`} value={user}>
+                        {user}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  Пользователь справа
+                  <select value={compareAssigneeRight} onChange={(event) => setCompareAssigneeRight(event.target.value)}>
+                    {jiraUserOptions.map((user) => (
+                      <option key={`right-${user}`} value={user}>
+                        {user}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </article>
+          </section>
+
+          {compareLoading && <div className="state-card">Собираю данные для сравнения...</div>}
+
+          {!compareLoading && compareDataLeft && compareDataRight && (
+            <>
+              <section className="grid compare-summary-grid">
+                {compareSummaryCards.map((item) => (
+                  <article key={item.label} className="card kpi-card">
+                    <TitleWithHint title={item.label} hint={item.hint} />
+                    <p className="compare-kpi-line">
+                      <strong>{compareDataLeft.assignee}:</strong> {item.formatter(item.left)}
+                    </p>
+                    <p className="compare-kpi-line">
+                      <strong>{compareDataRight.assignee}:</strong> {item.formatter(item.right)}
+                    </p>
+                    <p className="compare-delta">Разница: {item.formatter(item.left - item.right)}</p>
+                  </article>
+                ))}
+              </section>
+
+              <section className="grid analytics-grid">
+                <article className="card large-card">
+                  <TitleWithHint
+                    title="Ключевые метрики"
+                    hint="Сводное сравнение основных Jira-метрик двух сотрудников за одинаковый период."
+                  />
+                  <div className="compare-table">
+                    <div className="compare-table-head">Метрика</div>
+                    <div className="compare-table-head">{compareDataLeft.assignee}</div>
+                    <div className="compare-table-head">{compareDataRight.assignee}</div>
+                    <div className="compare-table-head">Дельта</div>
+                    {compareMetricRows.map((row) => (
+                      <Fragment key={row.label}>
+                        <div className="compare-cell compare-label">
+                          <TitleWithHint title={row.label} hint={row.hint} />
+                        </div>
+                        <div className="compare-cell">
+                          {formatNumber(row.left)}
+                        </div>
+                        <div className="compare-cell">
+                          {formatNumber(row.right)}
+                        </div>
+                        <div className="compare-cell">
+                          {formatDelta(row.delta)}
+                        </div>
+                      </Fragment>
+                    ))}
+                  </div>
+                </article>
+
+                <article className="card chart-card">
+                  <p className="card-title">Resolved по месяцам</p>
+                  <div className="chart-wrap">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <ComposedChart data={compareTrendData}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#d7e2ec" />
+                        <XAxis dataKey="monthLabel" tick={{ fontSize: 11 }} />
+                        <YAxis />
+                        <Tooltip />
+                        <Legend />
+                        <Bar dataKey="leftResolved" name={`${compareDataLeft.assignee} resolved`} fill="#2563eb" />
+                        <Bar dataKey="rightResolved" name={`${compareDataRight.assignee} resolved`} fill="#0f766e" />
+                        <Line type="monotone" dataKey="leftCreated" name={`${compareDataLeft.assignee} created`} stroke="#1d4ed8" strokeWidth={2} dot={false} />
+                        <Line type="monotone" dataKey="rightCreated" name={`${compareDataRight.assignee} created`} stroke="#047857" strokeWidth={2} dot={false} />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
+                </article>
+              </section>
+
+              <section className="grid analytics-grid">
+                <article className="card large-card">
+                  <TitleWithHint
+                    title="1. Задачи по месяцам"
+                    hint="Помесячное сравнение created и resolved за выбранный период. Показываются только данные из текущей Jira-выборки."
+                  />
+                  <div className="compare-table compare-table-monthly">
+                    <div className="compare-table-head">Месяц</div>
+                    <div className="compare-table-head">{compareDataLeft.assignee} created</div>
+                    <div className="compare-table-head">{compareDataLeft.assignee} closed</div>
+                    <div className="compare-table-head">{compareDataRight.assignee} created</div>
+                    <div className="compare-table-head">{compareDataRight.assignee} closed</div>
+                    {compareMonthlyRows.map((row) => (
+                      <Fragment key={`month-${row.monthLabel}`}>
+                        <div className="compare-cell compare-label">{row.monthLabel}</div>
+                        <div className="compare-cell">{formatNumber(row.leftCreated)}</div>
+                        <div className="compare-cell">{formatNumber(row.leftResolved)}</div>
+                        <div className="compare-cell">{formatNumber(row.rightCreated)}</div>
+                        <div className="compare-cell">{formatNumber(row.rightResolved)}</div>
+                      </Fragment>
+                    ))}
+                  </div>
+                </article>
+              </section>
+
+              <section className="grid analytics-grid">
+                <article className="card">
+                  <TitleWithHint
+                    title="2. Скорость и ритм"
+                    hint="Сводные показатели темпа за выбранный период и сигналы качества по последним 90 дням."
+                  />
+                  <div className="compare-table">
+                    <div className="compare-table-head">Показатель</div>
+                    <div className="compare-table-head">{compareDataLeft.assignee}</div>
+                    <div className="compare-table-head">{compareDataRight.assignee}</div>
+                    <div className="compare-table-head">Дельта</div>
+                    {compareSpeedRows.map((row) => (
+                      <Fragment key={`speed-${row.label}`}>
+                        <div className="compare-cell compare-label">
+                          <TitleWithHint title={row.label} hint={row.hint} />
+                        </div>
+                        <div className="compare-cell">{row.formatter(row.left)}</div>
+                        <div className="compare-cell">{row.formatter(row.right)}</div>
+                        <div className="compare-cell">{formatDelta((row.left ?? 0) - (row.right ?? 0))}</div>
+                      </Fragment>
+                    ))}
+                  </div>
+                </article>
+
+                <article className="card">
+                  <TitleWithHint
+                    title="3. Текущий хвост"
+                    hint="Сравнение незавершённой нагрузки, доли активной работы и признаков залипания."
+                  />
+                  <div className="compare-table">
+                    <div className="compare-table-head">Показатель</div>
+                    <div className="compare-table-head">{compareDataLeft.assignee}</div>
+                    <div className="compare-table-head">{compareDataRight.assignee}</div>
+                    <div className="compare-table-head">Дельта</div>
+                    {compareBacklogRows.map((row) => (
+                      <Fragment key={`backlog-${row.label}`}>
+                        <div className="compare-cell compare-label">
+                          <TitleWithHint title={row.label} hint={row.hint} />
+                        </div>
+                        <div className="compare-cell">{row.formatter(row.left)}</div>
+                        <div className="compare-cell">{row.formatter(row.right)}</div>
+                        <div className="compare-cell">{formatDelta((row.left ?? 0) - (row.right ?? 0))}</div>
+                      </Fragment>
+                    ))}
+                  </div>
+                </article>
+              </section>
+
+              <section className="grid analytics-grid">
+                <article className="card">
+                  <TitleWithHint
+                    title="4. Распределение работы и ответственности"
+                    hint="RACI-подобные прокси-метрики по Jira: ясность ответственности, фокус, контекстные переключения, ширина роли и нагрузка относительно темпа."
+                  />
+                  <div className="compare-table">
+                    <div className="compare-table-head">Показатель</div>
+                    <div className="compare-table-head">{compareDataLeft.assignee}</div>
+                    <div className="compare-table-head">{compareDataRight.assignee}</div>
+                    <div className="compare-table-head">Дельта</div>
+                    {compareResponsibilityRows.map((row) => (
+                      <Fragment key={`responsibility-${row.label}`}>
+                        <div className="compare-cell compare-label">
+                          <TitleWithHint title={row.label} hint={row.hint} />
+                        </div>
+                        <div className="compare-cell">{row.formatter(row.left)}</div>
+                        <div className="compare-cell">{row.formatter(row.right)}</div>
+                        <div className="compare-cell">{row.formatter((row.left ?? 0) - (row.right ?? 0))}</div>
+                      </Fragment>
+                    ))}
+                  </div>
+                </article>
+              </section>
+
+              <section className="grid analytics-grid">
+                <article className="card">
+                  <TitleWithHint
+                    title="5. Итоговый скоринг"
+                    hint="Используются уже рассчитанные баллы дашборда: предсказуемость, качество, поток, доставка и итоговый core score."
+                  />
+                  <div className="compare-table">
+                    <div className="compare-table-head">Критерий</div>
+                    <div className="compare-table-head">{compareDataLeft.assignee}</div>
+                    <div className="compare-table-head">{compareDataRight.assignee}</div>
+                    <div className="compare-table-head">Дельта</div>
+                    {compareScoreRows.map((row) => (
+                      <Fragment key={`score-${row.label}`}>
+                        <div className="compare-cell compare-label">{row.label}</div>
+                        <div className="compare-cell">{row.formatter(row.left)}</div>
+                        <div className="compare-cell">{row.formatter(row.right)}</div>
+                        <div className="compare-cell">{row.formatter(row.left - row.right)}</div>
+                      </Fragment>
+                    ))}
+                  </div>
+                </article>
+
+                <article className="card">
+                  <TitleWithHint
+                    title="6. Короткие выводы и риски"
+                    hint="Автоматическая выжимка только по доступным Jira-полям. Если сигнала в данных нет, блок остаётся коротким."
+                  />
+                  <div className="compare-notes">
+                    <div className="compare-notes-column">
+                      <p className="compare-notes-title">{compareDataLeft.assignee}</p>
+                      {compareNarratives?.left.length ? (
+                        compareNarratives.left.map((note) => (
+                          <p key={`left-note-${note}`} className="compare-note">
+                            {note}
+                          </p>
+                        ))
+                      ) : (
+                        <p className="compare-note">Нет выраженных сигналов по текущей выборке.</p>
+                      )}
+                    </div>
+                    <div className="compare-notes-column">
+                      <p className="compare-notes-title">{compareDataRight.assignee}</p>
+                      {compareNarratives?.right.length ? (
+                        compareNarratives.right.map((note) => (
+                          <p key={`right-note-${note}`} className="compare-note">
+                            {note}
+                          </p>
+                        ))
+                      ) : (
+                        <p className="compare-note">Нет выраженных сигналов по текущей выборке.</p>
+                      )}
+                    </div>
+                  </div>
+                </article>
+              </section>
+            </>
+          )}
+        </main>
+      )}
+
+      {view !== 'compare' && !loading && !error && data && (
         <main className="content">
           {aiAssessment && (
             <section className="grid">
@@ -611,6 +1352,12 @@ export default function App() {
                   Базовый общий рейтинг (только Jira):{' '}
                   <strong>{formatDecimal(data.characteristics.overallCoreScore)}</strong>
                   <Hint text="Среднее по четырем характеристикам. 80+ хорошо, 65-79 рабочий уровень, ниже 65 нужна стабилизация процесса." />
+                </p>
+                <p>
+                  Риск увольнения по метрикам:{' '}
+                  <strong>{formatPercent(data.characteristics.dismissalRiskPercent)}</strong> (
+                  {getDismissalRiskLabel(data.characteristics.dismissalRiskPercent)})
+                  <Hint text="Эвристический индекс 0-100% по Jira-метрикам: общий score, качество, предсказуемость, доля залипших задач, переоткрытия и давление WIP. Это не HR-вердикт, а управленческий сигнал." />
                 </p>
                 <p>
                   Подробная интерпретация рейтинга:

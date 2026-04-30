@@ -81,6 +81,7 @@ export type CharacteristicsStats = {
   flowScore: number;
   deliveryScore: number;
   overallCoreScore: number;
+  dismissalRiskPercent: number;
 };
 
 export type PersonalStats = {
@@ -117,6 +118,7 @@ export type CompetencyStats = {
 };
 
 export type DashboardData = {
+  assignee: string;
   fetchedAt: string;
   periodMonths: number;
   metrics: MetricPoint[];

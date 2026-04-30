@@ -54,6 +54,11 @@ body {
   opacity: 0.95;
 }
 
+.subtitle-compact {
+  margin-top: 0.45rem;
+  font-size: 0.92rem;
+}
+
 .card {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -119,7 +124,7 @@ select {
 .tabs {
   margin: 1rem 0;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.6rem;
 }
 
@@ -155,6 +160,11 @@ select {
 
 .analytics-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.compare-toolbar-grid,
+.compare-summary-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .forecast-grid {
@@ -305,6 +315,89 @@ select {
   margin: 0.5rem 0;
 }
 
+.compare-config-card {
+  grid-column: 1 / -1;
+}
+
+.compare-selects {
+  margin-top: 0.85rem;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.compare-kpi-line,
+.compare-delta {
+  margin: 0.35rem 0 0;
+}
+
+.compare-delta {
+  color: var(--muted);
+}
+
+.compare-table {
+  margin-top: 0.85rem;
+  display: grid;
+  grid-template-columns: minmax(180px, 1.4fr) repeat(3, minmax(0, 1fr));
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.compare-table-head,
+.compare-cell {
+  padding: 0.7rem 0.8rem;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+
+.compare-table-head {
+  font-size: 0.82rem;
+  font-weight: 800;
+  color: var(--muted);
+  background: #f8fbff;
+}
+
+.compare-label {
+  font-weight: 700;
+}
+
+.compare-table-monthly {
+  grid-template-columns: minmax(120px, 1.1fr) repeat(4, minmax(0, 1fr));
+}
+
+.compare-table > :nth-last-child(-n + 4) {
+  border-bottom: 0;
+}
+
+.compare-table-monthly > :nth-last-child(-n + 5) {
+  border-bottom: 0;
+}
+
+.compare-notes {
+  margin-top: 0.85rem;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.compare-notes-column {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f8fbff;
+  padding: 0.85rem;
+}
+
+.compare-notes-title {
+  margin: 0 0 0.55rem;
+  font-weight: 800;
+}
+
+.compare-note {
+  margin: 0.4rem 0 0;
+  color: var(--text);
+}
+
 .footer {
   font-size: 0.88rem;
   color: var(--muted);
@@ -313,6 +406,7 @@ select {
 
 @media (max-width: 1080px) {
   .overview-grid,
+  .compare-summary-grid,
   .forecast-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -326,8 +420,31 @@ select {
   .tabs,
   .overview-grid,
   .analytics-grid,
+  .compare-toolbar-grid,
+  .compare-summary-grid,
   .forecast-grid {
     grid-template-columns: 1fr;
+  }
+
+  .compare-selects,
+  .compare-table {
+    grid-template-columns: 1fr;
+  }
+
+  .compare-notes {
+    grid-template-columns: 1fr;
+  }
+
+  .compare-table > :nth-last-child(-n + 4) {
+    border-bottom: 1px solid var(--line);
+  }
+
+  .compare-table-monthly > :nth-last-child(-n + 5) {
+    border-bottom: 1px solid var(--line);
+  }
+
+  .compare-table > :last-child {
+    border-bottom: 0;
   }
 
   .large-card {
