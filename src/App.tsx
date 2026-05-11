@@ -26,6 +26,13 @@ import { calculateWorkHours } from './utils/hours';
 
 type View = 'overview' | 'analytics' | 'forecast' | 'compare';
 type PdfView = 'overview' | 'analytics';
+type ThemePreference = 'system' | 'light' | 'dark';
+
+const themeOptions: Array<{ value: ThemePreference; label: string }> = [
+  { value: 'system', label: 'Системная' },
+  { value: 'light', label: 'Светлая' },
+  { value: 'dark', label: 'Темная' }
+];
 
 const periodOptions = [
   { value: 12, label: '1 год' },
@@ -368,6 +375,20 @@ function TitleWithHint({ title, hint }: { title: string; hint?: string }) {
   );
 }
 
+function LoadingBlock({ label }: { label: string }) {
+  return (
+    <div className="state-card loading-card" role="status" aria-live="polite">
+      <span className="spinner" aria-hidden="true" />
+      <span>{label}</span>
+      <span className="loading-dots" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </span>
+    </div>
+  );
+}
+
 export default function App() {
   const [view, setView] = useState<View>('overview');
   const [periodMonths, setPeriodMonths] = useState(12);
@@ -387,10 +408,39 @@ export default function App() {
   const [salaryInput, setSalaryInput] = useState('');
   const [overtimeMultiplier, setOvertimeMultiplier] = useState(1);
   const [pdfExporting, setPdfExporting] = useState<PdfView | null>(null);
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
+    const saved = window.localStorage.getItem('jira-helper-theme');
+    return saved === 'light' || saved === 'dark' || saved === 'system' ? saved : 'system';
+  });
   const overviewSectionRef = useRef<HTMLElement | null>(null);
   const analyticsSectionRef = useRef<HTMLElement | null>(null);
 
   const hours = useMemo(() => calculateWorkHours(new Date()), []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+
+    function applyTheme() {
+      const resolvedTheme =
+        themePreference === 'system'
+          ? window.matchMedia('(prefers-color-scheme: dark)').matches
+            ? 'dark'
+            : 'light'
+          : themePreference;
+      root.dataset.theme = resolvedTheme;
+      root.dataset.themePreference = themePreference;
+      root.style.colorScheme = resolvedTheme;
+    }
+
+    applyTheme();
+    window.localStorage.setItem('jira-helper-theme', themePreference);
+
+    if (themePreference !== 'system') return;
+
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    media.addEventListener('change', applyTheme);
+    return () => media.removeEventListener('change', applyTheme);
+  }, [themePreference]);
 
   useEffect(() => {
     let cancelled = false;
@@ -864,15 +914,39 @@ export default function App() {
 
   return (
     <div className="page">
-<header className="hero">
-        <div>
-          <p className="eyebrow">JIRA Metrics Hub</p>
-          <h1>Дашборд загрузки, качества и прогнозов</h1>
-          <p className="subtitle">
-            Агрегаты строятся по вашим JQL через `total`, плюс тренды по месяцам, ETA хвоста и
-            качество оценки.
-          </p>
-          <p className="subtitle subtitle-compact">Текущий assignee: {selectedAssignee}</p>
+      <header className="hero">
+        <div className="hero-content">
+          <div className="hero-copy">
+            <p className="eyebrow">JIRA Metrics Hub</p>
+            <h1>Операционный дашборд загрузки, качества и прогнозов</h1>
+            <p className="subtitle">
+              Агрегаты строятся по вашим JQL через `total`, плюс тренды по месяцам, ETA хвоста,
+              качество оценки и финансовые ориентиры.
+            </p>
+          </div>
+          <div className="hero-panel">
+            <span className="panel-label">Текущий assignee</span>
+            <strong>{selectedAssignee}</strong>
+            <span>Период: {periodOptions.find((option) => option.value === periodMonths)?.label}</span>
+          </div>
+        </div>
+        <div className="hero-metrics" aria-label="Короткая сводка">
+          <div>
+            <span>Core score</span>
+            <strong>{formatDecimal(finalRating)}</strong>
+          </div>
+          <div>
+            <span>Resolved 90д</span>
+            <strong>{formatNumber(throughput90)}</strong>
+          </div>
+          <div>
+            <span>Текущий WIP</span>
+            <strong>{data ? formatNumber(metricByKey(data.metrics, 'wipNow')) : 'нет данных'}</strong>
+          </div>
+          <div>
+            <span>Worklog месяц</span>
+            <strong>{formatDecimal(loggedHoursCurrentMonth)} ч</strong>
+          </div>
         </div>
       </header>
 
@@ -892,6 +966,16 @@ export default function App() {
             Период графиков
             <select value={periodMonths} onChange={(event) => setPeriodMonths(Number(event.target.value))}>
               {periodOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            Тема
+            <select value={themePreference} onChange={(event) => setThemePreference(event.target.value as ThemePreference)}>
+              {themeOptions.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
                 </option>
@@ -957,7 +1041,7 @@ export default function App() {
         </button>
       </nav>
 
-      {loading && <div className="state-card">Тяну данные из Jira, это может занять время...</div>}
+      {loading && <LoadingBlock label="Тяну данные из Jira, это может занять время" />}
       {error && <div className="state-card error">{error}</div>}
       {compareError && view === 'compare' && <div className="state-card error">{compareError}</div>}
       {aiError && <div className="state-card error">{aiError}</div>}
@@ -992,7 +1076,7 @@ export default function App() {
             </article>
           </section>
 
-          {compareLoading && <div className="state-card">Собираю данные для сравнения...</div>}
+          {compareLoading && <LoadingBlock label="Собираю данные для сравнения" />}
 
           {!compareLoading && compareDataLeft && compareDataRight && (
             <>
@@ -1046,15 +1130,15 @@ export default function App() {
                   <div className="chart-wrap">
                     <ResponsiveContainer width="100%" height="100%">
                       <ComposedChart data={compareTrendData}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#d7e2ec" />
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                         <XAxis dataKey="monthLabel" tick={{ fontSize: 11 }} />
                         <YAxis />
                         <Tooltip />
                         <Legend />
-                        <Bar dataKey="leftResolved" name={`${compareDataLeft.assignee} resolved`} fill="#2563eb" />
-                        <Bar dataKey="rightResolved" name={`${compareDataRight.assignee} resolved`} fill="#0f766e" />
-                        <Line type="monotone" dataKey="leftCreated" name={`${compareDataLeft.assignee} created`} stroke="#1d4ed8" strokeWidth={2} dot={false} />
-                        <Line type="monotone" dataKey="rightCreated" name={`${compareDataRight.assignee} created`} stroke="#047857" strokeWidth={2} dot={false} />
+                        <Bar dataKey="leftResolved" name={`${compareDataLeft.assignee} resolved`} fill="var(--chart-1)" />
+                        <Bar dataKey="rightResolved" name={`${compareDataRight.assignee} resolved`} fill="var(--chart-2)" />
+                        <Line type="monotone" dataKey="leftCreated" name={`${compareDataLeft.assignee} created`} stroke="var(--chart-1)" strokeWidth={2} dot={false} />
+                        <Line type="monotone" dataKey="rightCreated" name={`${compareDataRight.assignee} created`} stroke="var(--chart-2)" strokeWidth={2} dot={false} />
                       </ComposedChart>
                     </ResponsiveContainer>
                   </div>
@@ -1241,6 +1325,29 @@ export default function App() {
               </article>
             </section>
           )}
+
+          <section className="insight-strip" aria-label="Основные сигналы">
+            <article className="insight-card">
+              <span className="insight-label">Предсказуемость</span>
+              <strong>{formatDecimal(data.characteristics.predictabilityScore)}</strong>
+              <span>{getHigherIsBetterAssessment(data.characteristics.predictabilityScore, 80, 60)}</span>
+            </article>
+            <article className="insight-card">
+              <span className="insight-label">Качество</span>
+              <strong>{formatDecimal(data.characteristics.qualityScore)}</strong>
+              <span>{getHigherIsBetterAssessment(data.characteristics.qualityScore, 80, 60)}</span>
+            </article>
+            <article className="insight-card">
+              <span className="insight-label">Фокус исполнения</span>
+              <strong>{formatPercent(data.personal.executionFocusPercent)}</strong>
+              <span>{getHigherIsBetterAssessment(data.personal.executionFocusPercent, 55, 35)}</span>
+            </article>
+            <article className="insight-card">
+              <span className="insight-label">Риск увольнения</span>
+              <strong>{formatPercent(data.characteristics.dismissalRiskPercent)}</strong>
+              <span>{getDismissalRiskLabel(data.characteristics.dismissalRiskPercent)}</span>
+            </article>
+          </section>
 
           {view === 'overview' && (
             <section className="grid overview-grid" ref={overviewSectionRef}>
@@ -1451,14 +1558,14 @@ export default function App() {
                 <div className="chart-wrap">
                   <ResponsiveContainer width="100%" height="100%">
                     <RadarChart data={competencyRadarData} outerRadius="72%">
-                      <PolarGrid stroke="#d7e2ec" />
+                      <PolarGrid stroke="var(--chart-grid)" />
                       <PolarAngleAxis dataKey="skill" tick={{ fontSize: 11 }} />
                       <PolarRadiusAxis domain={[0, 60]} tick={{ fontSize: 10 }} />
                       <Radar
                         name="Компетенции"
                         dataKey="score"
-                        stroke="#2563eb"
-                        fill="#2563eb"
+                        stroke="var(--chart-2)"
+                        fill="var(--chart-2)"
                         fillOpacity={0.28}
                       />
                       <Tooltip formatter={(value) => [formatDecimal(Number(value)), 'Score']} />
@@ -1489,7 +1596,7 @@ export default function App() {
                 <div className="chart-wrap">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={data.monthly}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#d7e2ec" />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                       <XAxis dataKey="monthLabel" tick={{ fontSize: 11 }} />
                       <YAxis />
                       <Tooltip />
@@ -1498,7 +1605,7 @@ export default function App() {
                         type="monotone"
                         dataKey="created"
                         name="Создано"
-                        stroke="#f59e0b"
+                        stroke="var(--chart-4)"
                         strokeWidth={2.5}
                         dot={false}
                       />
@@ -1506,7 +1613,7 @@ export default function App() {
                         type="monotone"
                         dataKey="resolved"
                         name="Выполнено"
-                        stroke="#2563eb"
+                        stroke="var(--chart-2)"
                         strokeWidth={2.5}
                         dot={false}
                       />
@@ -1522,17 +1629,17 @@ export default function App() {
                 <div className="chart-wrap">
                   <ResponsiveContainer width="100%" height="100%">
                     <ComposedChart data={data.monthly}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#d7e2ec" />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                       <XAxis dataKey="monthLabel" tick={{ fontSize: 11 }} />
                       <YAxis />
                       <Tooltip />
                       <Legend />
-                      <Bar dataKey="resolved" name="Выполнено" fill="#1f8a70" radius={[8, 8, 0, 0]} />
+                      <Bar dataKey="resolved" name="Выполнено" fill="var(--chart-2)" radius={[8, 8, 0, 0]} />
                       <Line
                         type="monotone"
                         dataKey="ma3"
                         name="Скользящее среднее за 3 месяца"
-                        stroke="#7c3aed"
+                        stroke="var(--chart-1)"
                         dot={false}
                         strokeWidth={2}
                       />
@@ -1540,7 +1647,7 @@ export default function App() {
                         type="monotone"
                         dataKey="ma6"
                         name="Скользящее среднее за 6 месяцев"
-                        stroke="#dc2626"
+                        stroke="var(--chart-5)"
                         dot={false}
                         strokeWidth={2}
                       />
@@ -1554,11 +1661,11 @@ export default function App() {
                 <div className="chart-wrap">
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={data.monthly}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#d7e2ec" />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                       <XAxis dataKey="monthLabel" tick={{ fontSize: 11 }} />
                       <YAxis />
                       <Tooltip />
-                      <Bar dataKey="bugs" fill="#ef4444" radius={[8, 8, 0, 0]} />
+                      <Bar dataKey="bugs" fill="var(--chart-5)" radius={[8, 8, 0, 0]} />
                     </BarChart>
                   </ResponsiveContainer>
                 </div>
@@ -1569,7 +1676,7 @@ export default function App() {
                 <div className="chart-wrap">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={data.wipTrend}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#d7e2ec" />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                       <XAxis dataKey="date" tick={{ fontSize: 11 }} />
                       <YAxis />
                       <Tooltip />
@@ -1577,7 +1684,7 @@ export default function App() {
                         type="monotone"
                         dataKey="wip"
                         name="Задачи в работе"
-                        stroke="#0f766e"
+                        stroke="var(--chart-3)"
                         strokeWidth={2.5}
                         dot={false}
                       />
@@ -1591,7 +1698,7 @@ export default function App() {
                 <div className="chart-wrap">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={data.monthly}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#d7e2ec" />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                       <XAxis dataKey="monthLabel" tick={{ fontSize: 11 }} />
                       <YAxis domain={[0, 100]} />
                       <Tooltip />
@@ -1600,7 +1707,7 @@ export default function App() {
                         type="monotone"
                         dataKey="estimateCoveragePercent"
                         name="Покрытие оценкой %"
-                        stroke="#2563eb"
+                        stroke="var(--chart-2)"
                         strokeWidth={2.2}
                         dot={false}
                       />
@@ -1608,7 +1715,7 @@ export default function App() {
                         type="monotone"
                         dataKey="urgentSharePercent"
                         name="Срочные задачи %"
-                        stroke="#f59e0b"
+                        stroke="var(--chart-4)"
                         strokeWidth={2.2}
                         dot={false}
                       />
@@ -1616,7 +1723,7 @@ export default function App() {
                         type="monotone"
                         dataKey="bugSharePercent"
                         name="Доля багов %"
-                        stroke="#dc2626"
+                        stroke="var(--chart-5)"
                         strokeWidth={2.2}
                         dot={false}
                       />
@@ -1636,7 +1743,7 @@ export default function App() {
                   <div className="chart-wrap">
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={monthlyMoneyTrend}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#d7e2ec" />
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                         <XAxis dataKey="monthLabel" tick={{ fontSize: 11 }} />
                         <YAxis />
                         <Tooltip />
@@ -1645,7 +1752,7 @@ export default function App() {
                           type="monotone"
                           dataKey="costPerTask"
                           name="Стоимость 1 задачи"
-                          stroke="#0f766e"
+                          stroke="var(--chart-3)"
                           strokeWidth={2.2}
                           dot={false}
                         />
@@ -1653,7 +1760,7 @@ export default function App() {
                           type="monotone"
                           dataKey="bugCost"
                           name="Стоимость багов в месяце"
-                          stroke="#7c3aed"
+                          stroke="var(--chart-2)"
                           strokeWidth={2.2}
                           dot={false}
                         />
