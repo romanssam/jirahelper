@@ -531,6 +531,73 @@ select:focus,
   padding-top: 4px;
 }
 
+.flow-kpi-grid,
+.flow-facts-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.flow-kpi,
+.flow-facts-grid p {
+  min-width: 0;
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  padding: 12px;
+  background: hsl(var(--muted) / 0.42);
+}
+
+.flow-kpi {
+  display: grid;
+  gap: 10px;
+}
+
+.flow-kpi strong {
+  font-family: 'Space Grotesk', 'Manrope', sans-serif;
+  font-size: 1.45rem;
+}
+
+.flow-facts-grid p {
+  margin: 0;
+}
+
+.metric-list-block {
+  margin-top: 16px;
+}
+
+.metric-list-title {
+  margin: 0 0 8px;
+  color: hsl(var(--muted-foreground));
+  font-size: 0.82rem;
+  font-weight: 900;
+}
+
+.mini-table {
+  display: grid;
+  grid-template-columns: minmax(100px, 0.8fr) minmax(180px, 2fr) minmax(96px, 0.8fr);
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+}
+
+.mini-cell {
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid hsl(var(--border));
+  background: hsl(var(--card));
+  overflow-wrap: anywhere;
+}
+
+.mini-key,
+.mini-value {
+  font-weight: 900;
+}
+
+.mini-table > :nth-last-child(-n + 3) {
+  border-bottom: 0;
+}
+
 .hint {
   position: relative;
   display: inline-flex;
@@ -881,6 +948,8 @@ select:focus,
   .compare-toolbar-grid,
   .compare-summary-grid,
   .forecast-grid,
+  .flow-kpi-grid,
+  .flow-facts-grid,
   .compare-selects,
   .compare-notes,
   .insight-strip,
@@ -912,12 +981,14 @@ select:focus,
   }
 
   .compare-table,
-  .compare-table-monthly {
+  .compare-table-monthly,
+  .mini-table {
     display: block;
   }
 
   .compare-table-head,
-  .compare-cell {
+  .compare-cell,
+  .mini-cell {
     display: block;
     border-bottom: 1px solid hsl(var(--border));
   }
@@ -927,7 +998,8 @@ select:focus,
   }
 
   .compare-table > :last-child,
-  .compare-table-monthly > :last-child {
+  .compare-table-monthly > :last-child,
+  .mini-table > :last-child {
     border-bottom: 0;
   }
 

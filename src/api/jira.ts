@@ -1,12 +1,14 @@
 import type {
   CompetencyStats,
   DashboardData,
+  FlowStats,
   MetricPoint,
   MonthlyPoint,
   PersonalStats,
   QualityStats,
   SnapshotPoint
 } from '../types';
+import { fetchGitLabStats } from './gitlab';
 
 const baseUrl = import.meta.env.DEV ? '/jira' : import.meta.env.VITE_JIRA_BASE_URL;
 const email = import.meta.env.VITE_JIRA_USER_EMAIL;
@@ -17,6 +19,33 @@ const reopenedStatuses = (import.meta.env.VITE_JIRA_REOPENED_STATUSES ?? 'Reopen
   .split(',')
   .map((value: string) => value.trim())
   .filter(Boolean);
+const inProgressStatuses = (import.meta.env.VITE_JIRA_IN_PROGRESS_STATUSES ?? 'In Progress,В работе')
+  .split(',')
+  .map((value: string) => value.trim())
+  .filter(Boolean);
+const doneStatuses = (import.meta.env.VITE_JIRA_DONE_STATUSES ?? 'Done,Готово,Closed,Resolved')
+  .split(',')
+  .map((value: string) => value.trim())
+  .filter(Boolean);
+const reviewStatuses = (import.meta.env.VITE_JIRA_REVIEW_STATUSES ?? 'Review,Code Review,Ревью,На ревью')
+  .split(',')
+  .map((value: string) => value.trim())
+  .filter(Boolean);
+const blockedStatuses = (import.meta.env.VITE_JIRA_BLOCKED_STATUSES ?? 'Blocked,Блокед,Заблокировано,Блокировано')
+  .split(',')
+  .map((value: string) => value.trim())
+  .filter(Boolean);
+const clarificationStatuses = (import.meta.env.VITE_JIRA_CLARIFICATION_STATUSES ?? 'Уточнение деталей,Clarification,Need details')
+  .split(',')
+  .map((value: string) => value.trim())
+  .filter(Boolean);
+const qaStatuses = (import.meta.env.VITE_JIRA_QA_STATUSES ?? 'QA,Testing,Тестирование,Acceptance,Приемка,Приёмка')
+  .split(',')
+  .map((value: string) => value.trim())
+  .filter(Boolean);
+const plannedCloseField = import.meta.env.VITE_JIRA_PLANNED_CLOSE_FIELD ?? 'duedate';
+const epicLinkField = import.meta.env.VITE_JIRA_EPIC_LINK_FIELD ?? 'customfield_10008';
+const detailedMaxPages = Number(import.meta.env.VITE_JIRA_DETAILED_MAX_PAGES ?? 10);
 const WIP_SNAPSHOT_KEY = 'jira_dashboard_wip_snapshots';
 const MAX_CONCURRENCY = 4;
 const inFlightByPeriod = new Map<string, Promise<DashboardData>>();
@@ -73,6 +102,26 @@ const competencyModel: Array<{ key: string; label: string; keywords: string[] }>
   }
 ];
 
+function isPlaceholder(value: string | undefined, markers: string[]) {
+  if (!value) return true;
+  const normalized = value.trim().toLowerCase();
+  return markers.some((marker) => normalized.includes(marker));
+}
+
+function assertJiraConfig() {
+  if (!baseUrl || isPlaceholder(baseUrl, ['example.com', 'your-company', 'localhost.invalid'])) {
+    throw new Error('Jira не настроена: укажите реальный VITE_JIRA_BASE_URL в локальном .env.');
+  }
+
+  if (isPlaceholder(token, ['dummy', 'put_', 'token_here', 'your_token'])) {
+    throw new Error('Jira не авторизуется: в локальном .env стоит placeholder вместо VITE_JIRA_API_TOKEN.');
+  }
+
+  if (authType === 'basic' && isPlaceholder(email, ['demo', 'your.email', 'example.com'])) {
+    throw new Error('Jira basic auth требует реальный VITE_JIRA_USER_EMAIL в локальном .env.');
+  }
+}
+
 function getAuthHeader() {
   if (!token) return undefined;
   if (authType === 'bearer') return `Bearer ${token}`;
@@ -108,6 +157,7 @@ async function fetchSearch<T = { total?: number; issues?: Array<{ fields?: Recor
   jql: string,
   extraParams: Record<string, string> = {}
 ): Promise<T> {
+  assertJiraConfig();
   if (!baseUrl) {
     throw new Error('Не указан VITE_JIRA_BASE_URL');
   }
@@ -128,6 +178,11 @@ async function fetchSearch<T = { total?: number; issues?: Array<{ fields?: Recor
   });
 
   if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error(
+        `JIRA вернула 401 Unauthorized. Проверьте VITE_JIRA_API_TOKEN и VITE_JIRA_AUTH_TYPE=${authType}; для Jira Server/DC часто нужен bearer PAT, для basic нужен email/login + API token.`
+      );
+    }
     if (response.status === 403) {
       throw new Error('JIRA вернула 403. Проверьте токен/тип auth/права на JQL.');
     }
@@ -138,6 +193,7 @@ async function fetchSearch<T = { total?: number; issues?: Array<{ fields?: Recor
 }
 
 async function fetchIssueWorklogPage(issueKey: string, startAt: number, maxResults: number) {
+  assertJiraConfig();
   if (!baseUrl) {
     throw new Error('Не указан VITE_JIRA_BASE_URL');
   }
@@ -224,6 +280,178 @@ function round2(value: number): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function median(values: number[]): number | null {
+  const finite = values.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+  if (!finite.length) return null;
+  const middle = Math.floor(finite.length / 2);
+  if (finite.length % 2) return round2(finite[middle]);
+  return round2((finite[middle - 1] + finite[middle]) / 2);
+}
+
+function average(values: number[]): number | null {
+  const finite = values.filter((value) => Number.isFinite(value));
+  if (!finite.length) return null;
+  return round2(finite.reduce((sum, value) => sum + value, 0) / finite.length);
+}
+
+function daysBetween(startIso: string, endIso: string): number {
+  return Math.max(0, (Date.parse(endIso) - Date.parse(startIso)) / 86_400_000);
+}
+
+function hoursFromSeconds(seconds: number): number {
+  return round2(seconds / 3600);
+}
+
+function isSameStatus(status: string | undefined | null, variants: string[]) {
+  if (!status) return false;
+  const normalized = status.trim().toLowerCase();
+  return variants.some((variant) => variant.trim().toLowerCase() === normalized);
+}
+
+function isUrgentIssue(fields: {
+  priority?: { name?: string };
+  labels?: string[];
+  summary?: string;
+  issuetype?: { name?: string };
+}) {
+  const priority = fields.priority?.name?.toLowerCase() ?? '';
+  const text = [fields.summary, fields.issuetype?.name, ...(fields.labels ?? [])].filter(Boolean).join(' ').toLowerCase();
+  return (
+    priority === 'high' ||
+    priority === 'highest' ||
+    /\b(hotfix|prod|production|incident|urgent|срочн|авар)\b/i.test(text)
+  );
+}
+
+function toDateOnly(iso: string) {
+  return iso.slice(0, 10);
+}
+
+type JiraIssueForFlow = {
+  key?: string;
+  fields?: {
+    summary?: string;
+    created?: string;
+    resolved?: string | null;
+    resolutiondate?: string | null;
+    updated?: string;
+    status?: { name?: string; statusCategory?: { key?: string; name?: string } };
+    project?: { key?: string; name?: string };
+    components?: Array<{ name?: string }>;
+    labels?: string[];
+    priority?: { name?: string };
+    issuetype?: { name?: string };
+    timespent?: number | null;
+    timeoriginalestimate?: number | null;
+    worklog?: {
+      total?: number;
+      worklogs?: Array<{
+        started?: string;
+        timeSpentSeconds?: number;
+        author?: { emailAddress?: string; name?: string; key?: string; displayName?: string };
+      }>;
+    };
+  } & Record<string, unknown>;
+  changelog?: {
+    histories?: Array<{
+      created?: string;
+      items?: Array<{
+        field?: string;
+        fromString?: string | null;
+        toString?: string | null;
+      }>;
+    }>;
+  };
+};
+
+type StatusEvent = {
+  at: string;
+  from?: string | null;
+  to?: string | null;
+};
+
+type WorklogEntry = {
+  started?: string;
+  timeSpentSeconds?: number;
+  author?: { emailAddress?: string; name?: string; key?: string; displayName?: string };
+};
+
+function getStatusEvents(issue: JiraIssueForFlow): StatusEvent[] {
+  return (issue.changelog?.histories ?? [])
+    .flatMap((history) =>
+      (history.items ?? [])
+        .filter((item) => item.field?.toLowerCase() === 'status' && history.created)
+        .map((item) => ({ at: history.created as string, from: item.fromString, to: item.toString }))
+    )
+    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+}
+
+function firstTransitionTo(statusEvents: StatusEvent[], statuses: string[]): string | null {
+  return statusEvents.find((event) => isSameStatus(event.to, statuses))?.at ?? null;
+}
+
+function lastTransitionTo(statusEvents: StatusEvent[], statuses: string[]): string | null {
+  return [...statusEvents].reverse().find((event) => isSameStatus(event.to, statuses))?.at ?? null;
+}
+
+function hasTransitionToInPeriod(statusEvents: StatusEvent[], statuses: string[], periodStart: string, periodEnd: string): boolean {
+  return statusEvents.some((event) => event.at >= periodStart && event.at <= periodEnd && isSameStatus(event.to, statuses));
+}
+
+function hasReturnedBack(statusEvents: StatusEvent[]): boolean {
+  const laterWorkStatuses = [...inProgressStatuses, ...reopenedStatuses];
+  const fromDoneOrReview = [...doneStatuses, ...reviewStatuses, ...qaStatuses];
+  return statusEvents.some(
+    (event) => isSameStatus(event.from, fromDoneOrReview) && isSameStatus(event.to, laterWorkStatuses)
+  );
+}
+
+function getStatusDurations(issue: JiraIssueForFlow, periodStart: string, periodEnd: string) {
+  const created = issue.fields?.created ?? periodStart;
+  const currentStatus = issue.fields?.status?.name ?? '';
+  const events = getStatusEvents(issue);
+  const timeline = events.map((event) => ({ at: event.at, status: event.to ?? '' }));
+  const firstKnownStatus = events[0]?.from ?? currentStatus;
+  const boundaries = [
+    { at: created, status: firstKnownStatus ?? '' },
+    ...timeline,
+    { at: periodEnd, status: currentStatus }
+  ].sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  const result = new Map<string, number>();
+
+  for (let index = 0; index < boundaries.length - 1; index += 1) {
+    const current = boundaries[index];
+    const next = boundaries[index + 1];
+    if (!current.status) continue;
+    const start = Math.max(Date.parse(current.at), Date.parse(periodStart));
+    const end = Math.min(Date.parse(next.at), Date.parse(periodEnd));
+    if (end <= start) continue;
+    result.set(current.status, (result.get(current.status) ?? 0) + (end - start) / 86_400_000);
+  }
+
+  return result;
+}
+
+function getMaxConsecutiveWorklogDays(dates: string[]) {
+  const unique = Array.from(new Set(dates)).sort();
+  if (!unique.length) return 0;
+  let maxStreak = 1;
+  let current = 1;
+
+  for (let index = 1; index < unique.length; index += 1) {
+    const previous = Date.parse(unique[index - 1]);
+    const next = Date.parse(unique[index]);
+    if ((next - previous) / 86_400_000 === 1) {
+      current += 1;
+      maxStreak = Math.max(maxStreak, current);
+    } else {
+      current = 1;
+    }
+  }
+
+  return maxStreak;
 }
 
 async function mapWithConcurrency<T, R>(
@@ -622,6 +850,285 @@ async function fetchCurrentMonthWorklogStats(
   }
 }
 
+async function fetchFullIssueWorklogs(issue: JiraIssueForFlow): Promise<WorklogEntry[]> {
+  const key = issue.key;
+  const inlineWorklog = issue.fields?.worklog;
+  let worklogs: WorklogEntry[] = inlineWorklog?.worklogs ?? [];
+  const inlineTotal = inlineWorklog?.total ?? worklogs.length;
+
+  if (key && inlineTotal > worklogs.length) {
+    let wlStartAt = 0;
+    const wlPageSize = 100;
+    const full: WorklogEntry[] = [];
+    while (true) {
+      const wlPage = await fetchIssueWorklogPage(key, wlStartAt, wlPageSize);
+      const entries = wlPage.worklogs ?? [];
+      if (!entries.length) break;
+      full.push(...entries);
+      wlStartAt += wlPageSize;
+      if (full.length >= (wlPage.total ?? full.length)) break;
+    }
+    worklogs = full;
+  }
+
+  return worklogs;
+}
+
+async function fetchFlowStats(assignee: string, periodStartDate: string): Promise<FlowStats> {
+  const periodStart = `${periodStartDate}T00:00:00.000Z`;
+  const periodEnd = new Date().toISOString();
+  const fields = [
+    'summary',
+    'created',
+    'updated',
+    'resolutiondate',
+    'status',
+    'project',
+    'components',
+    'labels',
+    'priority',
+    'issuetype',
+    'timespent',
+    'timeoriginalestimate',
+    'worklog',
+    plannedCloseField,
+    epicLinkField
+  ].join(',');
+  const jql = buildJql([
+    assigneeWasClause(assignee),
+    `(updated >= ${quote(periodStartDate)} OR resolved >= ${quote(periodStartDate)} OR created >= ${quote(periodStartDate)})`
+  ]);
+  const issues: JiraIssueForFlow[] = [];
+  let startAt = 0;
+  let total = 0;
+
+  try {
+    for (let page = 0; page < detailedMaxPages; page += 1) {
+      const payload = await fetchSearch<{ total?: number; issues?: JiraIssueForFlow[] }>(jql, {
+        startAt: String(startAt),
+        maxResults: '50',
+        fields,
+        expand: 'changelog'
+      });
+      const pageIssues = payload.issues ?? [];
+      if (page === 0) total = payload.total ?? 0;
+      if (!pageIssues.length) break;
+      issues.push(...pageIssues);
+      startAt += 50;
+      if (issues.length >= total) break;
+    }
+  } catch (error) {
+    console.warn('Flow stats fallback:', error);
+  }
+
+  const statusBuckets = new Map<string, { totalDays: number; issueKeys: Set<string> }>();
+  const inProgressToDoneDays: number[] = [];
+  const createdToClosedDays: number[] = [];
+  const currentOpenWorkDays: number[] = [];
+  const noEstimateWithSpentIssues: FlowStats['noEstimateWithSpentIssues'] = [];
+  const topLongest: FlowStats['topLongest'] = [];
+  const topOverestimated: FlowStats['topOverestimated'] = [];
+  const topUnderestimated: FlowStats['topUnderestimated'] = [];
+  const topStuck: FlowStats['topStuck'] = [];
+  const projects = new Set<string>();
+  const components = new Set<string>();
+  const epics = new Set<string>();
+  const worklogIssueKeys: string[] = [];
+  let periodAdded = 0;
+  let periodReopened = 0;
+  let periodChanged = 0;
+  let plannedToClose = 0;
+  let actuallyClosed = 0;
+  let urgentClosed = 0;
+  let returnedBackCount = 0;
+  let closedSample = 0;
+  let returnedSample = 0;
+  let longContinuousWork = 0;
+  let contextSwitchingWork = 0;
+
+  const worklogSummaries = await mapWithConcurrency(issues, 3, async (issue) => {
+    const worklogs = await fetchFullIssueWorklogs(issue);
+    const filtered = worklogs.filter((entry) => {
+      if (!entry.started || !entry.timeSpentSeconds) return false;
+      return isWorklogByAssignee(entry.author, assignee) && entry.started >= periodStart && entry.started <= periodEnd;
+    });
+    return {
+      key: issue.key ?? '',
+      dates: filtered.map((entry) => toDateOnly(entry.started as string)),
+      seconds: filtered.reduce((sum, entry) => sum + (entry.timeSpentSeconds ?? 0), 0)
+    };
+  });
+  const worklogByIssue = new Map(worklogSummaries.map((item) => [item.key, item]));
+
+  issues.forEach((issue) => {
+    const fieldsForIssue = issue.fields ?? {};
+    const key = issue.key ?? '';
+    const summary = fieldsForIssue.summary ?? '';
+    const created = fieldsForIssue.created ?? '';
+    const resolved = fieldsForIssue.resolutiondate ?? fieldsForIssue.resolved ?? null;
+    const updated = fieldsForIssue.updated ?? '';
+    const statusName = fieldsForIssue.status?.name;
+    const projectKey = fieldsForIssue.project?.key ?? fieldsForIssue.project?.name;
+    const statusEvents = getStatusEvents(issue);
+
+    if (projectKey) projects.add(projectKey);
+    (fieldsForIssue.components ?? []).forEach((component) => {
+      if (component.name) components.add(component.name);
+    });
+    const epicValue = fieldsForIssue[epicLinkField];
+    if (typeof epicValue === 'string' && epicValue) epics.add(epicValue);
+    if (typeof epicValue === 'object' && epicValue && 'key' in epicValue) epics.add(String((epicValue as { key?: string }).key));
+
+    if (created >= periodStart && created <= periodEnd) periodAdded += 1;
+    if (updated >= periodStart && updated <= periodEnd) periodChanged += 1;
+    if (hasTransitionToInPeriod(statusEvents, reopenedStatuses, periodStart, periodEnd)) periodReopened += 1;
+
+    const plannedValue = fieldsForIssue[plannedCloseField];
+    if (typeof plannedValue === 'string' && plannedValue >= periodStartDate && plannedValue <= periodEnd.slice(0, 10)) {
+      plannedToClose += 1;
+    }
+
+    const isClosedInPeriod = Boolean(resolved && resolved >= periodStart && resolved <= periodEnd);
+    if (isClosedInPeriod) {
+      actuallyClosed += 1;
+      closedSample += 1;
+      if (isUrgentIssue(fieldsForIssue)) urgentClosed += 1;
+      if (created && resolved) {
+        const createdToClosed = daysBetween(created, resolved);
+        createdToClosedDays.push(createdToClosed);
+        topLongest.push({ key, summary, status: statusName, project: projectKey, value: round2(createdToClosed), unit: 'days' });
+      }
+      const inProgressAt = firstTransitionTo(statusEvents, inProgressStatuses);
+      const doneAt = lastTransitionTo(statusEvents, doneStatuses) ?? resolved;
+      if (inProgressAt && doneAt && doneAt >= inProgressAt) {
+        inProgressToDoneDays.push(daysBetween(inProgressAt, doneAt));
+      }
+    }
+
+    const returned = hasReturnedBack(statusEvents);
+    if (returned) returnedBackCount += 1;
+    if (statusEvents.length > 0) returnedSample += 1;
+
+    if (!resolved && (isSameStatus(statusName, inProgressStatuses) || fieldsForIssue.status?.statusCategory?.key === 'indeterminate')) {
+      const workStarted = lastTransitionTo(statusEvents, inProgressStatuses) ?? firstTransitionTo(statusEvents, inProgressStatuses) ?? created;
+      if (workStarted) {
+        const workDays = daysBetween(workStarted, periodEnd);
+        currentOpenWorkDays.push(workDays);
+        topStuck.push({ key, summary, status: statusName, project: projectKey, value: round2(workDays), unit: 'days' });
+      }
+    }
+
+    getStatusDurations(issue, periodStart, periodEnd).forEach((duration, status) => {
+      const isTrackedStatus =
+        isSameStatus(status, reviewStatuses) ||
+        isSameStatus(status, blockedStatuses) ||
+        isSameStatus(status, clarificationStatuses) ||
+        isSameStatus(status, qaStatuses);
+      if (!isTrackedStatus) return;
+      const current = statusBuckets.get(status) ?? { totalDays: 0, issueKeys: new Set<string>() };
+      current.totalDays += duration;
+      if (key) current.issueKeys.add(key);
+      statusBuckets.set(status, current);
+    });
+
+    const spent = fieldsForIssue.timespent ?? 0;
+    const estimate = fieldsForIssue.timeoriginalestimate ?? 0;
+    if (!estimate && spent > 0) {
+      noEstimateWithSpentIssues.push({
+        key,
+        summary,
+        status: statusName,
+        project: projectKey,
+        value: hoursFromSeconds(spent),
+        unit: 'hours'
+      });
+    }
+    if (estimate > 0 && spent > 0) {
+      if (estimate > spent * 1.5) {
+        topOverestimated.push({
+          key,
+          summary,
+          status: statusName,
+          project: projectKey,
+          value: round2(estimate / spent),
+          unit: 'ratio'
+        });
+      }
+      if (spent > estimate * 1.5) {
+        topUnderestimated.push({
+          key,
+          summary,
+          status: statusName,
+          project: projectKey,
+          value: round2(spent / estimate),
+          unit: 'ratio'
+        });
+      }
+    }
+
+    const worklog = worklogByIssue.get(key);
+    if (worklog && worklog.seconds > 0) {
+      worklogIssueKeys.push(key);
+      const maxStreak = getMaxConsecutiveWorklogDays(worklog.dates);
+      if (maxStreak >= 2 || worklog.seconds >= 14_400) longContinuousWork += 1;
+      if (worklog.dates.length <= 1 || maxStreak <= 1) contextSwitchingWork += 1;
+    }
+  });
+
+  const statusDurations = Array.from(statusBuckets.entries())
+    .map(([status, item]) => ({
+      status,
+      totalDays: round2(item.totalDays),
+      avgDays: item.issueKeys.size ? round2(item.totalDays / item.issueKeys.size) : 0,
+      issueCount: item.issueKeys.size
+    }))
+    .sort((a, b) => b.totalDays - a.totalDays);
+  const reviewQaStatuses = [...reviewStatuses, ...qaStatuses];
+  const reviewQaAcceptanceWaitDays = average(
+    statusDurations
+      .filter((item) => isSameStatus(item.status, reviewQaStatuses))
+      .map((item) => item.avgDays)
+  );
+  const issueKeys = issues.map((issue) => issue.key ?? '').filter(Boolean);
+  const gitlab = await fetchGitLabStats(issueKeys, periodStart);
+  const worklogIssueCount = worklogIssueKeys.length;
+
+  return {
+    periodStart: periodStartDate,
+    periodEnd: periodEnd.slice(0, 10),
+    sampledIssues: issues.length,
+    periodAdded,
+    periodReopened,
+    periodChanged,
+    plannedToClose,
+    actuallyClosed,
+    distinctProjects: projects.size,
+    distinctComponents: components.size,
+    distinctEpics: epics.size,
+    avgInProgressToDoneDays: average(inProgressToDoneDays),
+    medianInProgressToDoneDays: median(inProgressToDoneDays),
+    avgCreatedToClosedDays: average(createdToClosedDays),
+    medianCreatedToClosedDays: median(createdToClosedDays),
+    avgCurrentOpenWorkDays: average(currentOpenWorkDays),
+    currentOpenWorkIssues: currentOpenWorkDays.length,
+    statusDurations,
+    reviewQaAcceptanceWaitDays,
+    longContinuousWorkSharePercent:
+      worklogIssueCount > 0 ? round2((longContinuousWork / worklogIssueCount) * 100) : null,
+    contextSwitchingSharePercent:
+      worklogIssueCount > 0 ? round2((contextSwitchingWork / worklogIssueCount) * 100) : null,
+    urgentClosedSharePercent: closedSample > 0 ? round2((urgentClosed / closedSample) * 100) : null,
+    returnedBackSharePercent: returnedSample > 0 ? round2((returnedBackCount / returnedSample) * 100) : null,
+    returnedBackCount,
+    noEstimateWithSpentIssues: noEstimateWithSpentIssues.sort((a, b) => b.value - a.value).slice(0, 20),
+    topLongest: topLongest.sort((a, b) => b.value - a.value).slice(0, 10),
+    topOverestimated: topOverestimated.sort((a, b) => b.value - a.value).slice(0, 10),
+    topUnderestimated: topUnderestimated.sort((a, b) => b.value - a.value).slice(0, 10),
+    topStuck: topStuck.sort((a, b) => b.value - a.value).slice(0, 10),
+    gitlab
+  };
+}
+
 async function buildDashboardData(periodMonths: number, assigneeOverride?: string): Promise<DashboardData> {
   const assignee = resolveAssignee(assigneeOverride);
   const metricsPlan: Array<{ key: string; label: string; jql: string }> = [
@@ -775,7 +1282,12 @@ async function buildDashboardData(periodMonths: number, assigneeOverride?: strin
     ma6: ma6[index]
   }));
 
-  const qualityStats = await fetchIssueQualityStats90(assignee);
+  const [qualityStats, worklog, competency, flow] = await Promise.all([
+    fetchIssueQualityStats90(assignee),
+    fetchCurrentMonthWorklogStats(assignee),
+    fetchCompetencyStatsYear(assignee),
+    fetchFlowStats(assignee, buckets[0]?.start ?? formatMonthStart(monthStart(new Date())))
+  ]);
   const throughput90 = metricValue('throughput90');
   const resolvedWithEstimate90 = qualityStats.resolvedWithEstimate;
   const noEstimate90 = qualityStats.noEstimateWithSpent;
@@ -861,8 +1373,6 @@ async function buildDashboardData(periodMonths: number, assigneeOverride?: strin
     makeVolumeAssessment('За полгода', metricValue('throughput180'), metricValue('withEstimate180'), 6),
     makeVolumeAssessment('За год', metricValue('throughput365'), metricValue('withEstimate365'), 12)
   ];
-  const worklog = await fetchCurrentMonthWorklogStats(assignee);
-  const competency = await fetchCompetencyStatsYear(assignee);
   const bugRate90 = throughput90 > 0 ? (metricValue('bugs90') / throughput90) * 100 : 0;
   const reopenedRate90 = throughput90 > 0 ? (metricValue('reopened90') / throughput90) * 100 : 0;
   const throughput365 = metricValue('throughput365');
@@ -952,6 +1462,7 @@ async function buildDashboardData(periodMonths: number, assigneeOverride?: strin
     wipTrend: snapshots
     ,
     worklog,
+    flow,
     characteristics: {
       predictabilityScore,
       qualityScore,

@@ -21,7 +21,7 @@ import {
 } from 'recharts';
 import { generateAiAssessment } from './api/ai';
 import { fetchDashboardData } from './api/jira';
-import type { AiAssessment, DashboardData, MetricPoint } from './types';
+import type { AiAssessment, DashboardData, IssueMetricItem, MetricPoint, StatusDurationItem } from './types';
 import { calculateWorkHours } from './utils/hours';
 
 type View = 'overview' | 'analytics' | 'forecast' | 'compare';
@@ -84,6 +84,29 @@ function formatMoney(value: number | null): string {
 
 function formatDateTime(iso: string): string {
   return new Intl.DateTimeFormat('ru-RU', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(iso));
+}
+
+function readStoredValue<T>(key: string, fallback: T, validate?: (value: unknown) => value is T): T {
+  const raw = window.localStorage.getItem(key);
+  if (!raw) return fallback;
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (validate) return validate(parsed) ? parsed : fallback;
+    return parsed as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function useStoredState<T>(key: string, fallback: T, validate?: (value: unknown) => value is T) {
+  const [value, setValue] = useState<T>(() => readStoredValue(key, fallback, validate));
+
+  useEffect(() => {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
+
+  return [value, setValue] as const;
 }
 
 function getLoadIndexAssessment(value: number | null): string {
@@ -181,6 +204,13 @@ function formatDelta(value: number): string {
 function formatPercent(value: number | null): string {
   if (value == null || !Number.isFinite(value)) return 'нет данных';
   return `${formatDecimal(value)}%`;
+}
+
+function formatMetricItemValue(item: IssueMetricItem): string {
+  if (item.unit === 'days') return `${formatDecimal(item.value)} д`;
+  if (item.unit === 'hours') return `${formatDecimal(item.value)} ч`;
+  if (item.unit === 'ratio') return `x${formatDecimal(item.value)}`;
+  return formatNumber(item.value);
 }
 
 function getDismissalRiskLabel(value: number | null): string {
@@ -389,13 +419,68 @@ function LoadingBlock({ label }: { label: string }) {
   );
 }
 
+function IssueMetricList({ title, items }: { title: string; items: IssueMetricItem[] }) {
+  return (
+    <div className="metric-list-block">
+      <p className="metric-list-title">{title}</p>
+      {items.length ? (
+        <div className="mini-table">
+          {items.slice(0, 8).map((item) => (
+            <Fragment key={`${title}-${item.key}`}>
+              <div className="mini-cell mini-key">{item.key}</div>
+              <div className="mini-cell">{item.summary || 'Без summary'}</div>
+              <div className="mini-cell mini-value">{formatMetricItemValue(item)}</div>
+            </Fragment>
+          ))}
+        </div>
+      ) : (
+        <p className="progress-label">Нет задач по этому признаку.</p>
+      )}
+    </div>
+  );
+}
+
+function StatusDurationList({ items }: { items: StatusDurationItem[] }) {
+  if (!items.length) {
+    return <p className="progress-label">Нет статусов из выбранного списка в текущей выборке.</p>;
+  }
+
+  return (
+    <div className="mini-table status-duration-table">
+      {items.slice(0, 8).map((item) => (
+        <Fragment key={item.status}>
+          <div className="mini-cell mini-key">{item.status}</div>
+          <div className="mini-cell">Всего {formatDecimal(item.totalDays)} д</div>
+          <div className="mini-cell mini-value">Среднее {formatDecimal(item.avgDays)} д</div>
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
   const [view, setView] = useState<View>('overview');
-  const [periodMonths, setPeriodMonths] = useState(12);
+  const [periodMonths, setPeriodMonths] = useStoredState<number>(
+    'jira-helper-period-months',
+    12,
+    (value): value is number => typeof value === 'number' && periodOptions.some((option) => option.value === value)
+  );
   const [reloadNonce, setReloadNonce] = useState(0);
-  const [selectedAssignee, setSelectedAssignee] = useState<string>(defaultJiraUser);
-  const [compareAssigneeLeft, setCompareAssigneeLeft] = useState<string>(defaultJiraUser);
-  const [compareAssigneeRight, setCompareAssigneeRight] = useState<string>(jiraUserOptions[1] ?? defaultJiraUser);
+  const [selectedAssignee, setSelectedAssignee] = useStoredState<string>(
+    'jira-helper-selected-assignee',
+    defaultJiraUser,
+    (value): value is string => typeof value === 'string' && value.length > 0
+  );
+  const [compareAssigneeLeft, setCompareAssigneeLeft] = useStoredState<string>(
+    'jira-helper-compare-left',
+    defaultJiraUser,
+    (value): value is string => typeof value === 'string' && value.length > 0
+  );
+  const [compareAssigneeRight, setCompareAssigneeRight] = useStoredState<string>(
+    'jira-helper-compare-right',
+    jiraUserOptions[1] ?? defaultJiraUser,
+    (value): value is string => typeof value === 'string' && value.length > 0
+  );
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -405,13 +490,22 @@ export default function App() {
   const [aiAssessment, setAiAssessment] = useState<AiAssessment | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
-  const [salaryInput, setSalaryInput] = useState('');
-  const [overtimeMultiplier, setOvertimeMultiplier] = useState(1);
+  const [salaryInput, setSalaryInput] = useStoredState<string>(
+    'jira-helper-salary-input',
+    '',
+    (value): value is string => typeof value === 'string'
+  );
+  const [overtimeMultiplier, setOvertimeMultiplier] = useStoredState<number>(
+    'jira-helper-overtime-multiplier',
+    1,
+    (value): value is number => typeof value === 'number' && [1, 1.5, 2].includes(value)
+  );
   const [pdfExporting, setPdfExporting] = useState<PdfView | null>(null);
-  const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
-    const saved = window.localStorage.getItem('jira-helper-theme');
-    return saved === 'light' || saved === 'dark' || saved === 'system' ? saved : 'system';
-  });
+  const [themePreference, setThemePreference] = useStoredState<ThemePreference>(
+    'jira-helper-theme',
+    'system',
+    (value): value is ThemePreference => value === 'light' || value === 'dark' || value === 'system'
+  );
   const overviewSectionRef = useRef<HTMLElement | null>(null);
   const analyticsSectionRef = useRef<HTMLElement | null>(null);
 
@@ -433,7 +527,6 @@ export default function App() {
     }
 
     applyTheme();
-    window.localStorage.setItem('jira-helper-theme', themePreference);
 
     if (themePreference !== 'system') return;
 
@@ -513,6 +606,46 @@ export default function App() {
         { label: 'Высокий и наивысший приоритет за 90 дней', value: metricByKey(data.metrics, 'fires90') },
         { label: 'Хотфиксы и прод-задачи за 90 дней', value: metricByKey(data.metrics, 'hotfix90') },
         { label: 'Закрытые баги 90д', value: metricByKey(data.metrics, 'bugs90') }
+      ]
+    : [];
+  const flowCards = data
+    ? [
+        {
+          label: 'In Progress → Done',
+          value: data.flow.avgInProgressToDoneDays,
+          suffix: 'д',
+          hint: 'Среднее количество календарных дней от первого перехода в In Progress до перехода в Done/закрытия.'
+        },
+        {
+          label: 'Создание → закрытие',
+          value: data.flow.avgCreatedToClosedDays,
+          suffix: 'д',
+          hint: 'Среднее количество календарных дней от created до resolutiondate по закрытым задачам периода.'
+        },
+        {
+          label: 'Открытые уже в работе',
+          value: data.flow.avgCurrentOpenWorkDays,
+          suffix: 'д',
+          hint: 'Средний возраст текущих открытых задач с момента последнего/первого входа в рабочий статус.'
+        },
+        {
+          label: 'Review/QA/acceptance',
+          value: data.flow.reviewQaAcceptanceWaitDays,
+          suffix: 'д',
+          hint: 'Среднее ожидание по статусам review, QA и acceptance из настроенных env-списков.'
+        },
+        {
+          label: 'Длинная работа',
+          value: data.flow.longContinuousWorkSharePercent,
+          suffix: '%',
+          hint: 'Доля задач с worklog-стриком от 2 дней или суммарным worklog от 4 часов в периоде.'
+        },
+        {
+          label: 'Возвраты назад',
+          value: data.flow.returnedBackSharePercent,
+          suffix: '%',
+          hint: 'Доля задач, где был переход из Done/Review/QA обратно в рабочие или reopened-статусы.'
+        }
       ]
     : [];
   const loggedHoursCurrentMonth = data?.worklog.loggedHoursCurrentMonth ?? 0;
@@ -999,6 +1132,15 @@ export default function App() {
             }
           >
             Экспорт JSON
+          </button>
+          <button
+            type="button"
+            className="ghost-btn"
+            onClick={() =>
+              data && triggerDownload('jira-dashboard-full.json', JSON.stringify(data, null, 2), 'application/json')
+            }
+          >
+            Экспорт всех данных
           </button>
           <button
             type="button"
@@ -1591,6 +1733,125 @@ export default function App() {
 
           {view === 'analytics' && (
             <section className="grid analytics-grid" ref={analyticsSectionRef}>
+              <article className="card large-card">
+                <TitleWithHint
+                  title="Расширенный flow-анализ за период"
+                  hint="Детальная выборка строится по задачам, которые обновлялись, создавались или закрывались в выбранном периоде. Для очень больших периодов действует лимит VITE_JIRA_DETAILED_MAX_PAGES."
+                />
+                <p>
+                  Период: <strong>{data.flow.periodStart}</strong> - <strong>{data.flow.periodEnd}</strong>,
+                  детально проанализировано задач: <strong>{formatNumber(data.flow.sampledIssues)}</strong>.
+                </p>
+                <div className="flow-kpi-grid">
+                  {flowCards.map((item) => (
+                    <div key={item.label} className="flow-kpi">
+                      <TitleWithHint title={item.label} hint={item.hint} />
+                      <strong>
+                        {formatDecimal(item.value)} {item.value == null ? '' : item.suffix}
+                      </strong>
+                    </div>
+                  ))}
+                </div>
+              </article>
+
+              <article className="card large-card">
+                <TitleWithHint
+                  title="Изменения и охват периода"
+                  hint="Created/updated/reopened берутся из Jira; planned close считается по due date или полю VITE_JIRA_PLANNED_CLOSE_FIELD, так как спринтов нет."
+                />
+                <div className="flow-facts-grid">
+                  <p>
+                    Добавилось задач: <strong>{formatNumber(data.flow.periodAdded)}</strong>
+                  </p>
+                  <p>
+                    Переоткрылось: <strong>{formatNumber(data.flow.periodReopened)}</strong>
+                  </p>
+                  <p>
+                    Изменилось: <strong>{formatNumber(data.flow.periodChanged)}</strong>
+                  </p>
+                  <p>
+                    Планировалось закрыть: <strong>{formatNumber(data.flow.plannedToClose)}</strong>
+                  </p>
+                  <p>
+                    Реально закрыто: <strong>{formatNumber(data.flow.actuallyClosed)}</strong>
+                  </p>
+                  <p>
+                    Проектов: <strong>{formatNumber(data.flow.distinctProjects)}</strong>
+                  </p>
+                  <p>
+                    Компонентов: <strong>{formatNumber(data.flow.distinctComponents)}</strong>
+                  </p>
+                  <p>
+                    Эпиков: <strong>{formatNumber(data.flow.distinctEpics)}</strong>
+                  </p>
+                  <p>
+                    Срочные среди закрытых:{' '}
+                    <strong>{formatPercent(data.flow.urgentClosedSharePercent)}</strong>
+                  </p>
+                  <p>
+                    Мелкие переключения по worklog:{' '}
+                    <strong>{formatPercent(data.flow.contextSwitchingSharePercent)}</strong>
+                  </p>
+                </div>
+              </article>
+
+              <article className="card large-card">
+                <TitleWithHint
+                  title="Время в статусах"
+                  hint="Сумма и среднее время по статусам Review, Blocked, Уточнение деталей, QA/Acceptance. Названия настраиваются через env."
+                />
+                <StatusDurationList items={data.flow.statusDurations} />
+              </article>
+
+              <article className="card large-card">
+                <TitleWithHint
+                  title="Связь Jira с GitLab"
+                  hint="Опционально: GitLab MR связываются с Jira по ключам задач в title/description/source branch. Работает при VITE_GITLAB_TOKEN."
+                />
+                {!data.flow.gitlab.enabled && (
+                  <p className="progress-label">GitLab не подключен: не задан VITE_GITLAB_TOKEN.</p>
+                )}
+                {data.flow.gitlab.enabled && data.flow.gitlab.error && (
+                  <p className="progress-label">Ошибка GitLab: {data.flow.gitlab.error}</p>
+                )}
+                {data.flow.gitlab.enabled && !data.flow.gitlab.error && (
+                  <>
+                    <p>
+                      Просканировано MR: <strong>{formatNumber(data.flow.gitlab.scannedMergeRequests)}</strong>,
+                      задач с MR: <strong>{formatNumber(data.flow.gitlab.linkedIssueCount)}</strong>.
+                    </p>
+                    <div className="mini-table">
+                      {data.flow.gitlab.linkedIssues.slice(0, 8).map((item) => (
+                        <Fragment key={`gitlab-${item.issueKey}`}>
+                          <div className="mini-cell mini-key">{item.issueKey}</div>
+                          <div className="mini-cell">MR: {formatNumber(item.mergeRequests)}</div>
+                          <div className="mini-cell mini-value">Merged: {formatNumber(item.merged)}</div>
+                        </Fragment>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </article>
+
+              <article className="card large-card">
+                <TitleWithHint
+                  title="Задачи, которые портят метрики"
+                  hint="Топы строятся по длительности, расхождению оценки с фактом и текущему залипанию."
+                />
+                <IssueMetricList title="Самые долгие creation → close" items={data.flow.topLongest} />
+                <IssueMetricList title="Самые переоцененные" items={data.flow.topOverestimated} />
+                <IssueMetricList title="Самые недооцененные" items={data.flow.topUnderestimated} />
+                <IssueMetricList title="Самые залипшие открытые" items={data.flow.topStuck} />
+              </article>
+
+              <article className="card large-card">
+                <TitleWithHint
+                  title="Без оценки, но с фактическим временем"
+                  hint="Список задач, где original estimate пустой, но timespent больше нуля."
+                />
+                <IssueMetricList title="Нет оценки, есть worklog/time spent" items={data.flow.noEstimateWithSpentIssues} />
+              </article>
+
               <article className="card chart-card">
                 <p className="card-title">Созданные и выполненные задачи по месяцам</p>
                 <div className="chart-wrap">

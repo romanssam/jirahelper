@@ -75,6 +75,72 @@ export type WorklogStats = {
   issuesWithWorklogsCurrentMonth: number;
 };
 
+export type IssueMetricItem = {
+  key: string;
+  summary: string;
+  status?: string;
+  project?: string;
+  value: number;
+  unit: 'days' | 'hours' | 'ratio' | 'count';
+};
+
+export type StatusDurationItem = {
+  status: string;
+  totalDays: number;
+  avgDays: number;
+  issueCount: number;
+};
+
+export type GitLabLinkedIssue = {
+  issueKey: string;
+  mergeRequests: number;
+  merged: number;
+  opened: number;
+  lastActivityAt: string | null;
+};
+
+export type GitLabStats = {
+  enabled: boolean;
+  baseUrl: string | null;
+  scannedMergeRequests: number;
+  linkedIssueCount: number;
+  linkedIssues: GitLabLinkedIssue[];
+  error?: string;
+};
+
+export type FlowStats = {
+  periodStart: string;
+  periodEnd: string;
+  sampledIssues: number;
+  periodAdded: number;
+  periodReopened: number;
+  periodChanged: number;
+  plannedToClose: number;
+  actuallyClosed: number;
+  distinctProjects: number;
+  distinctComponents: number;
+  distinctEpics: number;
+  avgInProgressToDoneDays: number | null;
+  medianInProgressToDoneDays: number | null;
+  avgCreatedToClosedDays: number | null;
+  medianCreatedToClosedDays: number | null;
+  avgCurrentOpenWorkDays: number | null;
+  currentOpenWorkIssues: number;
+  statusDurations: StatusDurationItem[];
+  reviewQaAcceptanceWaitDays: number | null;
+  longContinuousWorkSharePercent: number | null;
+  contextSwitchingSharePercent: number | null;
+  urgentClosedSharePercent: number | null;
+  returnedBackSharePercent: number | null;
+  returnedBackCount: number;
+  noEstimateWithSpentIssues: IssueMetricItem[];
+  topLongest: IssueMetricItem[];
+  topOverestimated: IssueMetricItem[];
+  topUnderestimated: IssueMetricItem[];
+  topStuck: IssueMetricItem[];
+  gitlab: GitLabStats;
+};
+
 export type CharacteristicsStats = {
   predictabilityScore: number;
   qualityScore: number;
@@ -127,6 +193,7 @@ export type DashboardData = {
   forecast: ForecastStats;
   wipTrend: SnapshotPoint[];
   worklog: WorklogStats;
+  flow: FlowStats;
   characteristics: CharacteristicsStats;
   personal: PersonalStats;
   competency: CompetencyStats;
